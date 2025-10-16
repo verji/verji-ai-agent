@@ -13,43 +13,25 @@ Verji AI Agent is a production-ready Matrix chatbot that combines:
 
 ## System Architecture
 
-```
-+--------------------------------------------------------------+
-|                        Matrix Server                         |
-|                     (Matrix /sync API)                       |
-+--------------------+-----------------------------------------+
-                     | Matrix Client-Server Protocol
-                     v
-+--------------------------------------------------------------+
-|            Verji vAgent Bot Service                          |
-|                  (matrix-rust-sdk)                           |
-|  +----------------------------------------------------------+ |
-|  | - Matrix event handling (messages, typing, etc.)       | |
-|  | - Session ID management (room:thread:user)             | |
-|  | - HITL coordination (admin room integration)           | |
-|  | - Message routing & formatting                         | |
-|  +----------------------------------------------------------+ |
-+--------------------+-----------------------------------------+
-                     | gRPC (bidirectional streaming)
-                     v
-+--------------------------------------------------------------+
-|          Verji vAgent Graph (LangGraph Service)              |
-|  +----------------------------------------------------------+ |
-|  | - LangGraph workflow execution                         | |
-|  | - LLM orchestration                                    | |
-|  | - HITL node handling                                   | |
-|  | - State persistence (via Redis checkpointer)           | |
-|  +----------------------------------------------------------+ |
-+--------------------+-----------------------------------------+
-                     |
-                     v
-+--------------------------------------------------------------+
-|                      Redis                                   |
-|  - Session state storage                                     |
-|  - LangGraph checkpoints (resume after HITL)                 |
-|  - HITL pubsub channels                                      |
-|  - Message history/context                                   |
-+--------------------------------------------------------------+
+```mermaid
+graph TD
+    A[Matrix Server<br/>Matrix /sync API] -->|Matrix Client-Server Protocol| B
+
+    B[Verji vAgent Bot Service<br/>matrix-rust-sdk<br/>━━━━━━━━━━━━━━━━━<br/>• Matrix event handling<br/>• Session ID management<br/>• HITL coordination<br/>• Message routing]
+
+    B -->|gRPC bidirectional streaming| C
+
+    C[Verji vAgent Graph<br/>LangGraph Service<br/>━━━━━━━━━━━━━━━━━<br/>• LangGraph workflow execution<br/>• LLM orchestration<br/>• HITL node handling<br/>• State persistence]
+
+    C -->|Redis connection| D
+    B -->|Redis connection| D
+
+    D[Redis<br/>━━━━━━━━━━━━━━━━━<br/>• Session state storage<br/>• LangGraph checkpoints<br/>• HITL pubsub channels<br/>• Message history/context]
+
+    style A fill:#e1f5ff
+    style B fill:#fff4e1
+    style C fill:#e8f5e9
+    style D fill:#fce4ec
 ```
 
 ---
@@ -173,69 +155,28 @@ impl SessionId {
 
 ### HITL Workflow
 
-```
-+---------------------------------------------------------+
-|                     Matrix Room (User)                  |
-|  User: "Help me with X"                                 |
-+---------------------------------------------------------+
-                    |
-                    v
-+---------------------------------------------------------+
-|            Verji vAgent Bot (matrix-rust-sdk)           |
-|  1. Receive message event                               |
-|  2. Extract session_id (room:thread:user)               |
-|  3. Send to verji-vagent-graph via gRPC                 |
-+---------------------------------------------------------+
-                    | gRPC
-                    v
-+---------------------------------------------------------+
-|            Verji vAgent Graph (LangGraph)               |
-|  1. Load graph state from Redis                         |
-|  2. Execute LangGraph nodes                             |
-|  3. Reach HITL node -> pause graph                      |
-|  4. Send HITLRequest back to bot via gRPC               |
-+---------------------------------------------------------+
-                    | gRPC
-                    v
-+---------------------------------------------------------+
-|            Verji vAgent Bot (HITL handler)              |
-|  1. Receive HITLRequest                                 |
-|  2. Post question to admin Matrix room                  |
-|  3. Subscribe to Redis pubsub: "hitl:{session_id}"      |
-|  4. Wait for admin response...                          |
-+---------------------------------------------------------+
-                    |
-                    v
-+---------------------------------------------------------+
-|              Matrix Admin Room                          |
-|  Bot: "? Approval needed for session ABC:"              |
-|       "User asks: 'Delete all records?'"                |
-|  Admin: "no - too risky"                                |
-+---------------------------------------------------------+
-                    |
-                    v
-+---------------------------------------------------------+
-|            Verji vAgent Bot (receives admin msg)        |
-|  1. Parse admin response                                |
-|  2. Publish to Redis: "hitl:{session_id}"               |
-|  3. Send feedback to verji-vagent-graph via gRPC        |
-+---------------------------------------------------------+
-                    | gRPC
-                    v
-+---------------------------------------------------------+
-|            Verji vAgent Graph (resumes)                 |
-|  1. Receive human feedback                              |
-|  2. Resume LangGraph from checkpoint                    |
-|  3. Update state with feedback                          |
-|  4. Complete workflow                                   |
-|  5. Return final response via gRPC                      |
-+---------------------------------------------------------+
-                    | gRPC
-                    v
-+---------------------------------------------------------+
-|            Verji vAgent Bot (sends final reply)         |
-|  Send response to original Matrix room                  |
-+---------------------------------------------------------+
+```mermaid
+sequenceDiagram
+    participant User as Matrix Room (User)
+    participant Bot as Verji vAgent Bot
+    participant Graph as Verji vAgent Graph
+    participant Admin as Matrix Admin Room
+    participant Redis as Redis Pubsub
+
+    User->>Bot: "Help me with X"
+    Note over Bot: 1. Receive message event<br/>2. Extract session_id
+    Bot->>Graph: gRPC: ProcessMessage
+    Note over Graph: 1. Load graph state from Redis<br/>2. Execute LangGraph nodes<br/>3. Reach HITL node → pause graph
+    Graph->>Bot: gRPC: HITLRequest
+    Note over Bot: 1. Receive HITLRequest<br/>2. Post question to admin room<br/>3. Subscribe to Redis pubsub
+    Bot->>Admin: "❓ Approval needed: Delete records?"
+    Admin->>Bot: "no - too risky"
+    Note over Bot: Parse admin response
+    Bot->>Redis: Publish feedback to hitl:{session_id}
+    Bot->>Graph: gRPC: SubmitHumanFeedback
+    Note over Graph: 1. Receive feedback<br/>2. Resume from checkpoint<br/>3. Update state<br/>4. Complete workflow
+    Graph->>Bot: gRPC: Final response
+    Bot->>User: Send final reply
 ```
 
 ### Key HITL Implementation Details
@@ -253,25 +194,23 @@ impl SessionId {
 
 **Each service runs independently** - no process spawning or forking.
 
-```
-+---------------------------------------------------------+
-|                   Docker Host / Kubernetes              |
-|                                                         |
-|  +--------------------+      +---------------------+   |
-|  |  verji-vagent-bot  |<---->| Redis               |   |
-|  |  - Matrix client   |      | - Session store     |   |
-|  |  - gRPC client     |      | - Checkpoints       |   |
-|  |  - HITL coordinator|      | - Pubsub            |   |
-|  +----------+---------+      +---------------------+   |
-|             | gRPC                    ^                |
-|             v                         |                |
-|  +-----------------------+            |                |
-|  |  verji-vagent-graph   |------------+                |
-|  |  - gRPC server        |                             |
-|  |  - LangGraph execution|                             |
-|  |  - LLM integration    |                             |
-|  +-----------------------+                             |
-+---------------------------------------------------------+
+```mermaid
+graph TB
+    subgraph k8s["Docker Host / Kubernetes"]
+        bot[verji-vagent-bot<br/>━━━━━━━━━━━━━━━<br/>• Matrix client<br/>• gRPC client<br/>• HITL coordinator]
+
+        graph[verji-vagent-graph<br/>━━━━━━━━━━━━━━━<br/>• gRPC server<br/>• LangGraph execution<br/>• LLM integration]
+
+        redis[Redis<br/>━━━━━━━━━━━━━━━<br/>• Session store<br/>• Checkpoints<br/>• Pubsub]
+
+        bot <-->|gRPC| graph
+        bot <-->|Redis protocol| redis
+        graph <-->|Redis protocol| redis
+    end
+
+    style bot fill:#fff4e1
+    style graph fill:#e8f5e9
+    style redis fill:#fce4ec
 ```
 
 ### Startup Order
