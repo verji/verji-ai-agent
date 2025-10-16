@@ -1,9 +1,9 @@
-# Python Service
+# Verji vAgent Graph
 
 LangGraph-based AI workflow service with gRPC server.
 
 ## Responsibilities
-- Receive messages from Rust bot via gRPC
+- Receive messages from verji-vagent-bot via gRPC
 - Execute LangGraph workflows
 - Integrate with LLMs (OpenAI, Anthropic)
 - Manage HITL nodes in workflows
@@ -11,7 +11,7 @@ LangGraph-based AI workflow service with gRPC server.
 
 ## Development
 \`\`\`bash
-cd python-service
+cd verji-vagent-graph
 poetry install
 poetry run python -m src.main
 \`\`\`

@@ -18,9 +18,9 @@
 ```
 Matrix Server (Verji)
     ↓ /sync protocol
-Rust Bot (matrix-rust-sdk)
+Verji vAgent Bot (matrix-rust-sdk)
     ↓ WebSocket + JSON-RPC (?)
-Python Service (LangGraph with HITL)
+Verji vAgent Graph (LangGraph with HITL)
 ```
 
 ### Recommended Design
@@ -32,7 +32,7 @@ Python Service (LangGraph with HITL)
                      │ Matrix Client-Server API
                      ▼
 ┌──────────────────────────────────────────────────────────────┐
-│                  Rust Bot Service                            │
+│            Verji vAgent Bot Service                          │
 │                  (matrix-rust-sdk)                          │
 │  ┌────────────────────────────────────────────────────────┐ │
 │  │ • Matrix event handling (messages, typing, etc.)       │ │
@@ -44,7 +44,7 @@ Python Service (LangGraph with HITL)
                      │ gRPC (bidirectional streaming)
                      ▼
 ┌──────────────────────────────────────────────────────────────┐
-│              Python LangGraph Service                        │
+│          Verji vAgent Graph (LangGraph Service)              │
 │  ┌────────────────────────────────────────────────────────┐ │
 │  │ • LangGraph workflow execution                         │ │
 │  │ • LLM orchestration                                    │ │
@@ -423,7 +423,7 @@ class SessionManager:
 └─────────────────────────────────────────────────────────┘
                     ▼
 ┌─────────────────────────────────────────────────────────┐
-│                Rust Bot (matrix-rust-sdk)               │
+│                Verji vAgent Bot (matrix-rust-sdk)               │
 │  1. Receive message event                               │
 │  2. Extract session_id (room:thread:user)               │
 │  3. Send to Python via gRPC stream                      │
@@ -1051,28 +1051,28 @@ sequenceDiagram
     DC->>Redis: 1. Start Redis first
     Redis-->>DC: Ready
 
-    DC->>Python: 2. Start Python service
-    Python->>Redis: Connect to Redis
-    Python->>Python: Start gRPC server on :50051
-    Python-->>DC: Health check OK
+    DC->>Graph: 2. Start verji-vagent-graph service
+    Graph->>Redis: Connect to Redis
+    Graph->>Graph: Start gRPC server on :50051
+    Graph-->>DC: Health check OK
 
-    DC->>Rust: 3. Start Rust bot
-    Rust->>Redis: Connect to Redis
-    Rust->>Python: Connect to gRPC (python-service:50051)
-    Rust->>Rust: Login to Matrix server
-    Rust->>Rust: Start /sync loop
-    Rust-->>DC: Health check OK
+    DC->>Bot: 3. Start Rust bot
+    Bot->>Redis: Connect to Redis
+    Bot->>Graph: Connect to gRPC (verji-vagent-graph:50051)
+    Bot->>Bot: Login to Matrix server
+    Bot->>Bot: Start /sync loop
+    Bot-->>DC: Health check OK
 
-    Note over Rust,Python: Services communicate via gRPC
-    Note over Rust,Redis: Services share session state via Redis
+    Note over Bot,Graph: Services communicate via gRPC
+    Note over Bot,Redis: Services share session state via Redis
 ```
 
 ### Service Communication
 
 **The services communicate over the Docker network (or K8s cluster network):**
 
-1. **Rust bot** makes **gRPC client calls** to `python-service:50051`
-2. **Python service** listens on **gRPC server** at `:50051`
+1. **verji-vagent-bot** makes **gRPC client calls** to `verji-vagent-graph:50051`
+2. **verji-vagent-graph** listens on **gRPC server** at `:50051`
 3. Both services connect to **Redis** at `redis:6379`
 
 **No process spawning, no forking. Just network calls.**
@@ -1095,9 +1095,9 @@ services:
       - redis_data:/data
     command: redis-server --appendonly yes
 
-  rust-bot:
+  verji-vagent-bot:
     build:
-      context: ./rust-bot
+      context: ./verji-vagent-bot
       dockerfile: Dockerfile
     depends_on:
       - redis
@@ -1111,9 +1111,9 @@ services:
       - ADMIN_ROOM_ID=!adminroom:matrix.org
     restart: unless-stopped
 
-  python-service:
+  verji-vagent-graph:
     build:
-      context: ./python-service
+      context: ./verji-vagent-graph
       dockerfile: Dockerfile
     depends_on:
       - redis
@@ -1243,12 +1243,12 @@ spec:
 if 'python-service' in services:
     # Build Docker image with live_update for hot reload
     docker_build(
-        'chatbot/python-service',
-        context='./python-service',
-        dockerfile='./python-service/Dockerfile.dev',
+        'chatbot/verji-vagent-graph',
+        context='./verji-vagent-graph',
+        dockerfile='./verji-vagent-graph/Dockerfile.dev',
         live_update=[
             # Sync Python source files
-            sync('./python-service/src', '/app/src'),
+            sync('./verji-vagent-graph/src', '/app/src'),
 
             # Restart on changes (Python picks up changes automatically)
             run('echo "Code synced - Python will auto-reload"'),
@@ -1333,16 +1333,16 @@ spec:
 if 'rust-bot' in services:
     # Custom build for Rust with incremental compilation
     custom_build(
-        'chatbot/rust-bot',
+        'chatbot/verji-vagent-bot',
         command='cd rust-bot && docker build -f Dockerfile.dev -t $EXPECTED_REF .',
-        deps=['./rust-bot/src', './rust-bot/Cargo.toml', './rust-bot/Cargo.lock'],
+        deps=['./verji-vagent-bot/src', './verji-vagent-bot/Cargo.toml', './verji-vagent-bot/Cargo.lock'],
         # Live update: sync source and recompile
         live_update=[
-            sync('./rust-bot/src', '/app/src'),
+            sync('./verji-vagent-bot/src', '/app/src'),
 
             # Incremental recompile (much faster than full rebuild)
             run('cd /app && cargo build --release',
-                trigger=['./rust-bot/src']),
+                trigger=['./verji-vagent-bot/src']),
 
             # Restart the binary
             restart_container(),
@@ -1643,7 +1643,7 @@ dev_mode = os.environ.get('TILT_DEV_MODE', 'local') == 'local'
 
 if dev_mode:
     # Local development with hot reload
-    docker_build('chatbot/python-service', ...)
+    docker_build('chatbot/verji-vagent-graph', ...)
 else:
     # Use pre-built image (faster startup, no hot reload)
     k8s_yaml(kustomize('./k8s/overlays/dev'))

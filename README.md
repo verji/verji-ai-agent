@@ -6,8 +6,8 @@ A Matrix chatbot combining Rust (matrix-rust-sdk) and Python (LangGraph) for int
 
 This project implements a production-ready Matrix chatbot with the following architecture:
 
-- **Rust Bot** (`rust-bot/`): Matrix client handling message events, session management, and HITL coordination
-- **Python Service** (`python-service/`): LangGraph-based AI workflow orchestration with LLM integration
+- **Verji vAgent Bot** (`verji-vagent-bot/`): Matrix client handling message events, session management, and HITL coordination
+- **Verji vAgent Graph** (`verji-vagent-graph/`): LangGraph-based AI workflow orchestration with LLM integration
 - **Redis**: Shared state store for sessions, checkpoints, and pubsub coordination
 - **gRPC**: Type-safe bidirectional communication between Rust and Python services
 
@@ -25,49 +25,58 @@ This project implements a production-ready Matrix chatbot with the following arc
 
 ### Prerequisites
 
-- **Rust** 1.75+
-- **Python** 3.11+
-- **Docker** & **Docker Compose**
-- **Kubernetes** cluster (minikube, kind, or cloud provider)
-- **Tilt** (for local development)
-- **Protocol Buffers** compiler (`protoc`)
+- **Kubernetes** cluster (minikube, kind, or Docker Desktop with K8s enabled)
+- **Tilt** (install from [tilt.dev](https://docs.tilt.dev/install.html))
+- **kubectl** configured for your cluster
 
-### Local Development (Docker Compose)
+**Optional (for production deployment):**
+- **Docker** & **Docker Compose**
+
+### Local Development (Tilt - Recommended)
+
+Tilt provides hot reload and the best developer experience:
 
 ```bash
 # 1. Clone repository
 git clone https://github.com/verji/verji-ai-agent.git
 cd verji-ai-agent
 
-# 2. Set up environment
+# 2. Start local Kubernetes cluster (if not already running)
+minikube start
+# or: kind create cluster
+# or: Enable Kubernetes in Docker Desktop
+
+# 3. Set up environment
 cp .env.example .env
 # Edit .env with your Matrix credentials and API keys
 
-# 3. Generate protobuf code
-./scripts/gen-proto.sh
-
-# 4. Start services
-docker-compose up
-```
-
-### Local Development (Tilt + Kubernetes)
-
-```bash
-# 1. Start local Kubernetes cluster (if not already running)
-minikube start
-# or: kind create cluster
-
-# 2. Set up environment
-cp .env.example .env
-# Edit .env with your credentials
-
-# 3. Start Tilt
+# 4. Start Tilt (this handles everything!)
 tilt up
 
 # Tilt web UI opens at http://localhost:10350
+# ✨ Features:
 # - Hot reload for Python (< 1 sec)
 # - Incremental compile for Rust (~15 sec)
-# - View logs, metrics, and health status
+# - Unified logs, metrics, and health status
+# - Manual triggers: proto-compile, integration-tests, redis-flush
+```
+
+**That's it!** Edit code and see changes instantly. Tilt handles builds, deployments, and restarts.
+
+### Production Deployment (Docker Compose)
+
+For production or testing production builds without hot reload:
+
+```bash
+# 1. Set up environment
+cp .env.example .env
+# Edit .env with your credentials
+
+# 2. Generate protobuf code (if not already done)
+./scripts/gen-proto.sh
+
+# 3. Start services
+docker-compose up -d
 ```
 
 ## Architecture
@@ -90,11 +99,10 @@ verji-ai-agent/
 ├── ARCHITECTURE.md             # Comprehensive technical documentation
 ├── Tiltfile                    # Local K8s development configuration
 ├── docker-compose.yml          # Production Docker Compose
-├── docker-compose.dev.yml      # Development Docker Compose
 ├── .env.example                # Environment variable template
 ├── proto/
 │   └── chatbot.proto          # gRPC protocol buffer definitions
-├── rust-bot/                  # Rust Matrix bot service
+├── verji-vagent-bot/          # Rust Matrix bot service
 │   ├── Cargo.toml
 │   ├── Dockerfile
 │   ├── Dockerfile.dev         # Development image with hot reload
@@ -102,9 +110,9 @@ verji-ai-agent/
 │   │   ├── main.rs            # Entry point
 │   │   ├── session.rs         # Session management
 │   │   ├── hitl.rs            # Human-in-the-loop handler
-│   │   └── grpc_client.rs     # gRPC client to Python service
+│   │   └── grpc_client.rs     # gRPC client to verji-vagent-graph
 │   └── tests/
-├── python-service/            # Python LangGraph service
+├── verji-vagent-graph/        # Python LangGraph service
 │   ├── pyproject.toml         # Poetry dependencies
 │   ├── Dockerfile
 │   ├── Dockerfile.dev         # Development image with hot reload
@@ -152,11 +160,11 @@ tilt down
 
 ```bash
 # Unit tests - Rust
-cd rust-bot
+cd verji-vagent-bot
 cargo test
 
 # Unit tests - Python
-cd python-service
+cd verji-vagent-graph
 poetry run pytest
 
 # Integration tests (requires running services)
@@ -170,8 +178,8 @@ poetry run pytest
 ./scripts/gen-proto.sh
 
 # This generates:
-# - rust-bot/src/proto/ (Rust gRPC code)
-# - python-service/src/proto/ (Python gRPC code)
+# - verji-vagent-bot/src/proto/ (Rust gRPC code)
+# - verji-vagent-graph/src/proto/ (Python gRPC code)
 ```
 
 ## Configuration
@@ -221,8 +229,8 @@ helm install verji-ai-agent ./helm/verji-ai-agent
 ## Monitoring & Observability
 
 - **Health checks**: Both services expose health endpoints
-  - Rust bot: `http://rust-bot:8080/health`
-  - Python service: gRPC health probe on port 50051
+  - verji-vagent-bot: `http://verji-vagent-bot:8080/health`
+  - verji-vagent-graph: gRPC health probe on port 50051
 - **Metrics**: Prometheus-compatible metrics (optional)
 - **Logs**: Structured JSON logs to stdout (captured by K8s)
 - **Tracing**: OpenTelemetry support (optional)
@@ -239,13 +247,13 @@ helm install verji-ai-agent ./helm/verji-ai-agent
 
 ```bash
 # Rust
-cd rust-bot
+cd verji-vagent-bot
 cargo fmt
 cargo clippy
 cargo test
 
 # Python
-cd python-service
+cd verji-vagent-graph
 poetry run black .
 poetry run ruff check .
 poetry run pytest

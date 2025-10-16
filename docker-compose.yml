@@ -10,9 +10,9 @@ services:
     command: redis-server --appendonly yes
     restart: unless-stopped
 
-  python-service:
+  verji-vagent-graph:
     build:
-      context: ./python-service
+      context: ./verji-vagent-graph
       dockerfile: Dockerfile
     depends_on:
       - redis
@@ -26,20 +26,20 @@ services:
       - "50051:50051"
     restart: unless-stopped
 
-  rust-bot:
+  verji-vagent-bot:
     build:
-      context: ./rust-bot
+      context: ./verji-vagent-bot
       dockerfile: Dockerfile
     depends_on:
       - redis
-      - python-service
+      - verji-vagent-graph
     environment:
       - MATRIX_HOMESERVER=${MATRIX_HOMESERVER}
       - MATRIX_USER=${MATRIX_USER}
       - MATRIX_PASSWORD=${MATRIX_PASSWORD}
       - ADMIN_ROOM_ID=${ADMIN_ROOM_ID}
       - REDIS_URL=redis://redis:6379
-      - GRPC_ENDPOINT=http://python-service:50051
+      - GRPC_ENDPOINT=http://verji-vagent-graph:50051
       - RUST_LOG=info,matrix_sdk=warn
     restart: unless-stopped
 

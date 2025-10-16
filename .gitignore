@@ -12,46 +12,46 @@
 .DS_Store
 
 # Rust
-rust-bot/target/
-rust-bot/**/*.rs.bk
-rust-bot/Cargo.lock
+verji-vagent-bot/target/
+verji-vagent-bot/**/*.rs.bk
+verji-vagent-bot/Cargo.lock
 
 # Python
-python-service/**/__pycache__/
-python-service/**/*.py[cod]
-python-service/**/*$py.class
-python-service/**/*.so
-python-service/.Python
-python-service/build/
-python-service/develop-eggs/
-python-service/dist/
-python-service/downloads/
-python-service/eggs/
-python-service/.eggs/
-python-service/lib/
-python-service/lib64/
-python-service/parts/
-python-service/sdist/
-python-service/var/
-python-service/wheels/
-python-service/**/*.egg-info/
-python-service/.installed.cfg
-python-service/*.egg
-python-service/MANIFEST
-python-service/.pytest_cache/
-python-service/.coverage
-python-service/htmlcov/
-python-service/.mypy_cache/
-python-service/.dmypy.json
-python-service/dmypy.json
-python-service/.ruff_cache/
+verji-vagent-graph/**/__pycache__/
+verji-vagent-graph/**/*.py[cod]
+verji-vagent-graph/**/*$py.class
+verji-vagent-graph/**/*.so
+verji-vagent-graph/.Python
+verji-vagent-graph/build/
+verji-vagent-graph/develop-eggs/
+verji-vagent-graph/dist/
+verji-vagent-graph/downloads/
+verji-vagent-graph/eggs/
+verji-vagent-graph/.eggs/
+verji-vagent-graph/lib/
+verji-vagent-graph/lib64/
+verji-vagent-graph/parts/
+verji-vagent-graph/sdist/
+verji-vagent-graph/var/
+verji-vagent-graph/wheels/
+verji-vagent-graph/**/*.egg-info/
+verji-vagent-graph/.installed.cfg
+verji-vagent-graph/*.egg
+verji-vagent-graph/MANIFEST
+verji-vagent-graph/.pytest_cache/
+verji-vagent-graph/.coverage
+verji-vagent-graph/htmlcov/
+verji-vagent-graph/.mypy_cache/
+verji-vagent-graph/.dmypy.json
+verji-vagent-graph/dmypy.json
+verji-vagent-graph/.ruff_cache/
 
 # Poetry
-python-service/poetry.lock
+verji-vagent-graph/poetry.lock
 
 # Protocol Buffers generated code
-rust-bot/src/proto/
-python-service/src/proto/
+verji-vagent-bot/src/proto/
+verji-vagent-graph/src/proto/
 
 # Docker
 .dockerignore
