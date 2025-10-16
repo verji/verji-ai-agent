@@ -1,0 +1,75 @@
+// chatbot.proto
+syntax = "proto3";
+
+package chatbot;
+
+service ChatbotService {
+  // Bidirectional stream for interactive conversations
+  rpc ProcessMessage(stream BotMessage) returns (stream BotResponse);
+
+  // For HITL feedback submission
+  rpc SubmitHumanFeedback(HumanFeedback) returns (FeedbackAck);
+
+  // Health check
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+message BotMessage {
+  string session_id = 1;           // Format: room_id:thread_id:user_id
+  string room_id = 2;              // Matrix room ID
+  string user_id = 3;              // Matrix user ID
+  string message = 4;              // User's message content
+  map<string, string> context = 5; // Additional context (room name, etc.)
+  int64 timestamp = 6;             // Unix timestamp
+}
+
+message BotResponse {
+  string session_id = 1;
+
+  oneof response_type {
+    TextMessage text = 2;          // Regular text response
+    HITLRequest hitl_request = 3;  // Request for human feedback
+    StreamChunk chunk = 4;         // Streaming response chunk
+    ErrorMessage error = 5;        // Error occurred
+  }
+}
+
+message TextMessage {
+  string content = 1;
+  bool is_final = 2;               // Is this the final response?
+}
+
+message HITLRequest {
+  string question = 1;             // Question for human reviewer
+  repeated string options = 2;     // Optional: predefined choices
+  string context = 3;              // Additional context for reviewer
+  int32 timeout_seconds = 4;       // How long to wait for response
+}
+
+message StreamChunk {
+  string content = 1;              // Partial content (for streaming)
+  int32 chunk_index = 2;           // Order of chunks
+}
+
+message ErrorMessage {
+  string error_code = 1;
+  string message = 2;
+}
+
+message HumanFeedback {
+  string session_id = 1;
+  string response = 2;             // Human's response/decision
+  map<string, string> metadata = 3;
+}
+
+message FeedbackAck {
+  bool success = 1;
+  string message = 2;
+}
+
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  string status = 1;
+  int32 active_sessions = 2;
+}

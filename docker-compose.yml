@@ -1,0 +1,47 @@
+version: "3.8"
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    restart: unless-stopped
+
+  python-service:
+    build:
+      context: ./python-service
+      dockerfile: Dockerfile
+    depends_on:
+      - redis
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - GRPC_PORT=50051
+      - LOG_LEVEL=info
+    ports:
+      - "50051:50051"
+    restart: unless-stopped
+
+  rust-bot:
+    build:
+      context: ./rust-bot
+      dockerfile: Dockerfile
+    depends_on:
+      - redis
+      - python-service
+    environment:
+      - MATRIX_HOMESERVER=${MATRIX_HOMESERVER}
+      - MATRIX_USER=${MATRIX_USER}
+      - MATRIX_PASSWORD=${MATRIX_PASSWORD}
+      - ADMIN_ROOM_ID=${ADMIN_ROOM_ID}
+      - REDIS_URL=redis://redis:6379
+      - GRPC_ENDPOINT=http://python-service:50051
+      - RUST_LOG=info,matrix_sdk=warn
+    restart: unless-stopped
+
+volumes:
+  redis_data:

@@ -1,0 +1,37 @@
+#!/bin/bash
+set -e
+
+# Create all necessary files for the repository
+
+# .env.example
+cat > .env.example << 'ENV_EOF'
+# Matrix Configuration
+MATRIX_HOMESERVER=https://matrix-client.matrix.org
+MATRIX_USER=@bot:matrix.org
+MATRIX_PASSWORD=your_bot_password_here
+ADMIN_ROOM_ID=!adminroom:matrix.org
+
+# Redis Configuration
+REDIS_URL=redis://localhost:6379
+
+# LLM API Keys
+OPENAI_API_KEY=sk-your-openai-key-here
+ANTHROPIC_API_KEY=sk-ant-your-anthropic-key-here
+
+# Development Toggles
+TILT_DEV_MODE=local
+USE_LOCAL_MATRIX=false
+ENABLE_OBSERVABILITY=false
+
+# gRPC Configuration
+GRPC_ENDPOINT=http://python-service:50051
+GRPC_PORT=50051
+
+# Logging
+RUST_LOG=info,matrix_sdk=warn
+LOG_LEVEL=info
+ENV_EOF
+
+echo "Created .env.example"
+
+# Continue script will be in next command due to length

@@ -1,0 +1,27 @@
+[tool.poetry]
+name = "python-service"
+version = "0.1.0"
+description = "LangGraph-based AI service for Matrix chatbot"
+authors = ["Verji Team <team@verji.com>"]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+langgraph = "^0.2"
+langchain = "^0.3"
+langchain-openai = "^0.2"
+langchain-anthropic = "^0.2"
+grpcio = "^1.60"
+grpcio-tools = "^1.60"
+redis = {extras = ["hiredis"], version = "^5.0"}
+watchfiles = "^0.21"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^7.4"
+pytest-asyncio = "^0.21"
+black = "^23.12"
+ruff = "^0.1"
+mypy = "^1.7"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

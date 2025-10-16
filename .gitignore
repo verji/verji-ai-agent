@@ -1,0 +1,79 @@
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Rust
+rust-bot/target/
+rust-bot/**/*.rs.bk
+rust-bot/Cargo.lock
+
+# Python
+python-service/**/__pycache__/
+python-service/**/*.py[cod]
+python-service/**/*$py.class
+python-service/**/*.so
+python-service/.Python
+python-service/build/
+python-service/develop-eggs/
+python-service/dist/
+python-service/downloads/
+python-service/eggs/
+python-service/.eggs/
+python-service/lib/
+python-service/lib64/
+python-service/parts/
+python-service/sdist/
+python-service/var/
+python-service/wheels/
+python-service/**/*.egg-info/
+python-service/.installed.cfg
+python-service/*.egg
+python-service/MANIFEST
+python-service/.pytest_cache/
+python-service/.coverage
+python-service/htmlcov/
+python-service/.mypy_cache/
+python-service/.dmypy.json
+python-service/dmypy.json
+python-service/.ruff_cache/
+
+# Poetry
+python-service/poetry.lock
+
+# Protocol Buffers generated code
+rust-bot/src/proto/
+python-service/src/proto/
+
+# Docker
+.dockerignore
+docker-compose.override.yml
+
+# Kubernetes
+k8s/secrets/
+*.kubeconfig
+
+# Logs
+*.log
+logs/
+
+# Redis
+dump.rdb
+appendonly.aof
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+
+# OS
+Thumbs.db
+.Trash-*
