@@ -9,7 +9,7 @@ Verji AI Agent is a production-ready Matrix chatbot that combines:
 - **Verji vAgent Bot** (Rust + matrix-rust-sdk): Matrix client for message handling and HITL coordination
 - **Verji vAgent Graph** (Python + LangGraph): AI workflow orchestration with LLM integration
 - **Redis**: Shared state store for sessions, checkpoints, and pubsub
-- **gRPC**: Type-safe bidirectional communication using Protocol Buffers
+- **HTTP/JSON**: Simple, debuggable communication between services
 
 ## System Architecture
 
@@ -21,7 +21,7 @@ graph TD
     D[(Redis<br/>━━━━━━━━━━━━━━━━━<br/>• Session state storage<br/>• LangGraph checkpoints<br/>• HITL pubsub channels<br/>• Message history/context)]
 
     A -->|Matrix Client-Server Protocol| B
-    B -->|gRPC bidirectional streaming| C
+    B -->|HTTP/JSON + SSE streaming| C
     C -.->|Redis connection| D
     B -.->|Redis connection| D
 
@@ -33,74 +33,145 @@ graph TD
 
 ---
 
-## 1. Service Communication (gRPC)
+## 1. Service Communication (HTTP/JSON)
 
-### Protocol Definition
+### Why JSON Over Protobuf
 
-All inter-service communication uses gRPC with Protocol Buffers for type safety and performance.
+**Design Decision:** Use JSON over HTTP for inter-service communication instead of gRPC/Protobuf.
 
-**Key features:**
-- **Type safety**: Protocol buffers enforce contracts between Rust and Python
-- **Bidirectional streaming**: Enables real-time HITL flows
-- **Performance**: Binary protocol, faster than JSON
-- **Mature ecosystem**: `tonic` (Rust) and `grpcio` (Python)
+**Rationale:**
+- **No performance bottleneck**: LLM API calls (seconds) and HITL workflows (minutes) dominate latency
+- **Development velocity**: No code generation, no proto compilation, faster iteration
+- **Debugging simplicity**: Human-readable logs, `curl`-friendly, immediate visibility in Tilt
+- **Ecosystem alignment**: Matrix (JSON), LangGraph checkpoints (JSON), Redis (JSON), LLM APIs (JSON)
+- **Horizontal scaling**: Performance issues solved by adding instances, not micro-optimizations
 
-### Protocol Buffer Schema
+### HTTP API Design
 
-The actual protocol is defined in `proto/chatbot.proto`:
+**REST-style endpoints with Server-Sent Events (SSE) for streaming:**
 
-```protobuf
-syntax = "proto3";
+#### POST /api/v1/process_message
+Send a message to the LangGraph workflow for processing.
 
-package chatbot;
-
-service ChatbotService {
-  // Bidirectional stream for interactive conversations
-  rpc ProcessMessage(stream BotMessage) returns (stream BotResponse);
-
-  // For HITL feedback submission
-  rpc SubmitHumanFeedback(HumanFeedback) returns (FeedbackAck);
-
-  // Health check
-  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+```json
+// Request
+{
+  "session_id": "!abc123:matrix.org:main:@user:matrix.org",
+  "room_id": "!abc123:matrix.org",
+  "user_id": "@user:matrix.org",
+  "message": "Help me delete old records",
+  "context": {
+    "room_name": "Support Room",
+    "user_display_name": "Alice"
+  },
+  "timestamp": 1697568000
 }
 
-message BotMessage {
-  string session_id = 1;           // Format: room_id:thread_id:user_id
-  string room_id = 2;              // Matrix room ID
-  string user_id = 3;              // Matrix user ID
-  string message = 4;              // User's message content
-  map<string, string> context = 5; // Additional context
-  int64 timestamp = 6;             // Unix timestamp
-}
+// Response (SSE stream)
+event: text_chunk
+data: {"content": "I can help you with that.", "chunk_index": 0}
 
-message BotResponse {
-  string session_id = 1;
+event: text_chunk
+data: {"content": " Let me check your permissions.", "chunk_index": 1}
 
-  oneof response_type {
-    TextMessage text = 2;          // Regular text response
-    HITLRequest hitl_request = 3;  // Request for human feedback
-    StreamChunk chunk = 4;         // Streaming response chunk
-    ErrorMessage error = 5;        // Error occurred
+event: hitl_request
+data: {"question": "Delete 1000 records older than 2020?", "options": ["yes", "no"], "timeout_seconds": 3600}
+
+event: text_final
+data: {"content": "Action cancelled per admin decision.", "is_final": true}
+
+event: done
+data: {}
+```
+
+#### POST /api/v1/submit_feedback
+Submit human feedback for a HITL request.
+
+```json
+// Request
+{
+  "session_id": "!abc123:matrix.org:main:@user:matrix.org",
+  "response": "no",
+  "metadata": {
+    "reviewer": "@admin:matrix.org",
+    "review_timestamp": "1697568120"
   }
 }
 
-message HITLRequest {
-  string question = 1;             // Question for human reviewer
-  repeated string options = 2;     // Optional: predefined choices
-  string context = 3;              // Additional context for reviewer
-  int32 timeout_seconds = 4;       // How long to wait for response
+// Response
+{
+  "success": true,
+  "message": "Feedback received and workflow resumed"
+}
+```
+
+#### GET /health
+Health check endpoint.
+
+```json
+{
+  "status": "healthy",
+  "active_sessions": 42,
+  "uptime_seconds": 86400
+}
+```
+
+### Message Schema Definitions
+
+Shared JSON schemas enforced via Rust structs (`serde`) and Python dataclasses (`dataclass`):
+
+```rust
+// Rust: verji-vagent-bot/src/types.rs
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BotMessage {
+    session_id: String,           // Format: room_id:thread_id:user_id
+    room_id: String,              // Matrix room ID
+    user_id: String,              // Matrix user ID
+    message: String,              // User's message content
+    context: HashMap<String, String>, // Additional context
+    timestamp: i64,               // Unix timestamp
 }
 
-// ... other message definitions
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum BotResponse {
+    TextChunk { content: String, chunk_index: u32 },
+    TextFinal { content: String, is_final: bool },
+    HITLRequest { question: String, options: Vec<String>, timeout_seconds: u32 },
+    Error { error_code: String, message: String },
+}
 ```
 
-**After editing the protocol:**
-```bash
-./scripts/gen-proto.sh
-# Generates Rust code in verji-vagent-bot/src/proto/
-# Generates Python code in verji-vagent-graph/src/proto/
+```python
+# Python: verji-vagent-graph/src/types.py
+from dataclasses import dataclass
+from typing import Optional
+
+@dataclass
+class BotMessage:
+    session_id: str           # Format: room_id:thread_id:user_id
+    room_id: str              # Matrix room ID
+    user_id: str              # Matrix user ID
+    message: str              # User's message content
+    context: dict[str, str]   # Additional context
+    timestamp: int            # Unix timestamp
+
+@dataclass
+class HITLRequest:
+    question: str             # Question for human reviewer
+    options: list[str]        # Optional: predefined choices
+    timeout_seconds: int      # How long to wait for response
 ```
+
+### Migration Path to Protobuf (If Needed)
+
+If performance becomes an issue (measure first!):
+1. Add Protobuf encoding alongside JSON
+2. Use content negotiation: `Accept: application/protobuf`
+3. Keep JSON as default for debugging
+4. Enable Protobuf per-endpoint or per-client
 
 ---
 
@@ -163,17 +234,17 @@ sequenceDiagram
 
     User->>+Bot: "Help me with X"
     Note over Bot: Receive message event<br/>Extract session_id
-    Bot->>+Graph: gRPC: ProcessMessage
+    Bot->>+Graph: POST /api/v1/process_message
     Note over Graph: Load graph state from Redis<br/>Execute LangGraph nodes<br/>Reach HITL node → pause graph
-    Graph-->>-Bot: gRPC: HITLRequest
+    Graph-->>-Bot: SSE: hitl_request event
     Note over Bot: Receive HITLRequest<br/>Post question to admin room<br/>Subscribe to Redis pubsub
     Bot->>+Admin: ❓ Approval needed: Delete records?
     Admin-->>-Bot: ❌ no - too risky
     Note over Bot: Parse admin response
     Bot->>Redis: Publish feedback to hitl:{session_id}
-    Bot->>+Graph: gRPC: SubmitHumanFeedback
+    Bot->>+Graph: POST /api/v1/submit_feedback
     Note over Graph: Receive feedback<br/>Resume from checkpoint<br/>Update state<br/>Complete workflow
-    Graph-->>-Bot: gRPC: Final response
+    Graph-->>-Bot: JSON: Success response
     Bot-->>-User: ✅ Send final reply
 ```
 
@@ -195,11 +266,11 @@ sequenceDiagram
 ```mermaid
 graph TB
     subgraph k8s["🐳 Docker Host / Kubernetes"]
-        bot[verji-vagent-bot<br/>━━━━━━━━━━━━━━━<br/>• Matrix client<br/>• gRPC client<br/>• HITL coordinator]
-        graph[verji-vagent-graph<br/>━━━━━━━━━━━━━━━<br/>• gRPC server<br/>• LangGraph execution<br/>• LLM integration]
+        bot[verji-vagent-bot<br/>━━━━━━━━━━━━━━━<br/>• Matrix client<br/>• HTTP client<br/>• HITL coordinator]
+        graph[verji-vagent-graph<br/>━━━━━━━━━━━━━━━<br/>• HTTP/SSE server<br/>• LangGraph execution<br/>• LLM integration]
         redis[(Redis<br/>━━━━━━━━━━━━━━━<br/>• Session store<br/>• Checkpoints<br/>• Pubsub)]
 
-        bot <-->|gRPC| graph
+        bot <-->|HTTP/JSON| graph
         bot -.->|Redis protocol| redis
         graph -.->|Redis protocol| redis
     end
@@ -213,13 +284,13 @@ graph TB
 ### Startup Order
 
 1. **Redis** - Start first
-2. **verji-vagent-graph** - Start gRPC server on `:50051`
+2. **verji-vagent-graph** - Start HTTP server on `:8000`
 3. **verji-vagent-bot** - Connect to graph and Matrix
 
 ### Communication
 
-- **verji-vagent-bot** → `verji-vagent-graph:50051` (gRPC client)
-- **verji-vagent-graph** → `:50051` (gRPC server)
+- **verji-vagent-bot** → `http://verji-vagent-graph:8000` (HTTP client with SSE support)
+- **verji-vagent-graph** → `:8000` (HTTP/SSE server)
 - **Both** → `redis:6379` (Redis client)
 
 ---
@@ -231,7 +302,8 @@ graph TB
 | Component | Library | Purpose |
 |-----------|---------|---------|
 | Matrix SDK | `matrix-rust-sdk` | Matrix protocol handling |
-| gRPC Client | `tonic` | Communication with graph service |
+| HTTP Client | `reqwest` | Communication with graph service |
+| SSE Client | `eventsource-client` or `reqwest-eventsource` | Server-Sent Events streaming |
 | Session Store | `redis` (async) | Session state persistence |
 | Async Runtime | `tokio` | Async task execution |
 | Serialization | `serde`, `serde_json` | JSON handling |
@@ -243,14 +315,15 @@ graph TB
 |-----------|---------|---------|
 | LangGraph | `langgraph` | Workflow orchestration |
 | LLM Integration | `langchain` | LLM calls (OpenAI, Anthropic) |
-| gRPC Server | `grpcio` | RPC server |
+| HTTP Server | `fastapi` or `aiohttp` | REST API + SSE endpoints |
 | Session Store | `redis` (async) | Session state + pubsub |
 | Checkpointer | `langgraph.checkpoint.redis` | Graph state persistence |
+| Serialization | `pydantic` | JSON schema validation |
 
 ### Infrastructure
 
 - **Redis 7**: Session state, checkpoints, HITL pubsub
-- **Protocol Buffers**: Type-safe contract between services
+- **HTTP/JSON**: Simple, debuggable inter-service communication
 - **Kubernetes**: Orchestration (local via Tilt, production via K8s)
 
 ---
@@ -281,15 +354,15 @@ tilt up
 ### Port Forwards
 
 - Redis: `localhost:6379`
-- verji-vagent-graph (gRPC): `localhost:50051`
+- verji-vagent-graph (HTTP): `localhost:8000`
 - verji-vagent-bot (metrics): `localhost:8080`
 
 ### Manual Triggers
 
 Click buttons in Tilt UI:
-- **proto-compile**: Regenerate gRPC code from `.proto`
 - **integration-tests**: Run full test suite
 - **redis-flush**: Clear all Redis data
+- **api-docs**: Open FastAPI Swagger docs
 
 ---
 
@@ -317,11 +390,11 @@ services:
       - redis
     environment:
       - REDIS_URL=redis://redis:6379
-      - GRPC_PORT=50051
+      - HTTP_PORT=8000
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
     ports:
-      - "50051:50051"
+      - "8000:8000"
 
   verji-vagent-bot:
     build:
@@ -336,7 +409,7 @@ services:
       - MATRIX_PASSWORD=${MATRIX_PASSWORD}
       - ADMIN_ROOM_ID=${ADMIN_ROOM_ID}
       - REDIS_URL=redis://redis:6379
-      - GRPC_ENDPOINT=http://verji-vagent-graph:50051
+      - GRAPH_API_ENDPOINT=http://verji-vagent-graph:8000
 
 volumes:
   redis_data:
@@ -432,7 +505,8 @@ async def create_chatbot_graph(session_manager):
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
-| **IPC Protocol** | gRPC | Type safety, bidirectional streaming, performance |
+| **IPC Protocol** | HTTP/JSON + SSE | Simplicity, debuggability, no codegen, streaming support |
+| **Serialization** | JSON | Human-readable, ecosystem alignment, no performance bottleneck |
 | **Session Storage** | Redis | Persistence, pubsub, multi-instance support |
 | **Session ID Format** | `room:thread:user` | Unique per conversation context |
 | **HITL Pattern** | Admin room + Redis pubsub | Clean separation, async coordination |
@@ -447,7 +521,7 @@ async def create_chatbot_graph(session_manager):
 ### Health Checks
 
 - **verji-vagent-bot**: HTTP endpoint at `:8080/health`
-- **verji-vagent-graph**: gRPC health probe on `:50051`
+- **verji-vagent-graph**: HTTP endpoint at `:8000/health`
 - **Redis**: Standard Redis `PING` command
 
 ### Logging
@@ -459,7 +533,7 @@ async def create_chatbot_graph(session_manager):
 ### Metrics
 
 - **verji-vagent-bot**: Prometheus-compatible metrics at `:8080/metrics`
-- **verji-vagent-graph**: Custom metrics via gRPC interceptors
+- **verji-vagent-graph**: Prometheus-compatible metrics at `:8000/metrics` (via FastAPI)
 - **Redis**: Standard Redis metrics
 
 ---
@@ -469,24 +543,26 @@ async def create_chatbot_graph(session_manager):
 ### Horizontal Scaling
 
 - **verji-vagent-bot**: Multiple instances can handle different rooms
-- **verji-vagent-graph**: Load balance via gRPC
+- **verji-vagent-graph**: Load balance via HTTP (nginx, K8s service)
 - **Redis**: Use Redis Cluster or Sentinel for HA
 
 ### Performance
 
-- **gRPC connection pooling**: Reuse connections between services
+- **HTTP connection pooling**: Reuse connections between services (via `reqwest` connection pool)
 - **Redis pipelining**: Batch Redis operations where possible
 - **LangGraph checkpointing**: Minimize checkpoint frequency
+- **SSE keepalive**: Maintain persistent connections for streaming responses
 
 ---
 
 ## Conclusion
 
 This architecture provides:
-- **Type safety** between Rust and Python via gRPC
-- **Scalability** through independent service deployment
+- **Simplicity** with JSON over HTTP for easy debugging and rapid iteration
+- **Scalability** through independent service deployment and horizontal scaling
 - **Reliability** via session persistence and graph checkpoints
-- **Clean HITL** implementation with async human feedback
-- **Developer experience** with Tilt hot reload
+- **Clean HITL** implementation with async human feedback via Redis pubsub
+- **Developer experience** with Tilt hot reload and human-readable logs
+- **Flexibility** to add Protobuf later if performance becomes a bottleneck (measure first!)
 
 The system is production-ready and designed for cloud-native deployment while maintaining excellent local development workflows.

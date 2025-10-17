@@ -10,7 +10,7 @@ Verji AI Agent is a production-ready Matrix chatbot combining Rust (matrix-rust-
 - **Verji vAgent Bot** (`verji-vagent-bot/`): Matrix client handling message events, session management, and HITL coordination
 - **Verji vAgent Graph** (`verji-vagent-graph/`): LangGraph-based AI workflow orchestration with LLM integration
 - **Redis**: Shared state store for sessions, checkpoints, and pubsub coordination
-- **gRPC**: Type-safe bidirectional communication between services using Protocol Buffers
+- **HTTP/JSON**: Simple, debuggable communication between services with Server-Sent Events (SSE) for streaming
 
 ## Development Commands
 
@@ -42,27 +42,15 @@ tilt down
 ```
 
 **Useful Tilt UI buttons:**
-- **proto-compile**: Regenerate protobuf code after editing `proto/chatbot.proto`
 - **integration-tests**: Run full integration test suite
 - **redis-flush**: Clear Redis cache/state
+- **api-docs**: Open FastAPI Swagger documentation for the Graph API
 
 **Edit workflow:**
 1. Edit Python files → changes sync and reload automatically in < 1 sec
 2. Edit Rust files → changes sync, incremental recompile in ~15 sec
 3. View logs from all services in unified dashboard
 4. No need to manually restart anything
-
-### Protocol Buffers
-```bash
-# After editing proto/chatbot.proto, regenerate gRPC code:
-# Option 1: Click "proto-compile" button in Tilt UI
-# Option 2: Run manually
-./scripts/gen-proto.sh
-
-# Generates:
-# - verji-vagent-bot/src/proto/ (Rust gRPC code)
-# - verji-vagent-graph/src/proto/ (Python gRPC code)
-```
 
 ### Running Tests
 
@@ -126,10 +114,11 @@ docker-compose down
 ## Architecture & Design Principles
 
 ### Service Communication
-- **gRPC** is used for all Rust ↔ Python communication (NOT WebSocket/JSON-RPC)
+- **HTTP/JSON + SSE** is used for all Rust ↔ Python communication (NOT gRPC/Protobuf or WebSocket/JSON-RPC)
+- **Rationale**: No performance bottleneck (LLM calls dominate latency), better debuggability, no code generation, ecosystem alignment
 - Services run as **separate containers** (no spawning/forking)
 - Both services (`verji-vagent-bot` and `verji-vagent-graph`) connect to shared **Redis** instance
-- Protocol defined in `proto/chatbot.proto` - always regenerate after changes
+- API defined in `verji-vagent-graph` using FastAPI with Server-Sent Events for streaming responses
 
 ### Session Management
 Sessions use hierarchical IDs: `{room_id}:{thread_id}:{user_id}`
@@ -147,11 +136,11 @@ Examples:
 
 The HITL workflow coordinates human approval for sensitive operations:
 
-1. **verji-vagent-graph** (LangGraph) detects risky action → sends `HITLRequest` via gRPC
-2. **verji-vagent-bot** posts question to admin Matrix room
+1. **verji-vagent-graph** (LangGraph) detects risky action → streams `hitl_request` event via SSE
+2. **verji-vagent-bot** receives event, posts question to admin Matrix room
 3. **verji-vagent-bot** subscribes to Redis pubsub channel: `hitl:{session_id}`
 4. **Admin** responds in Matrix room
-5. **verji-vagent-bot** publishes response to Redis channel
+5. **verji-vagent-bot** publishes response to Redis channel and POSTs to `/api/v1/submit_feedback`
 6. **verji-vagent-graph** receives feedback, resumes LangGraph from checkpoint
 
 **Key points:**
@@ -166,22 +155,29 @@ The HITL workflow coordinates human approval for sensitive operations:
 
 ## Code Structure
 
-### Protocol Buffers (proto/chatbot.proto)
-Defines the gRPC contract between services:
-- `ChatbotService`: Main service with `ProcessMessage` (bidirectional stream), `SubmitHumanFeedback`, `HealthCheck`
-- Message types: `BotMessage`, `BotResponse`, `HITLRequest`, `TextMessage`, `StreamChunk`, `ErrorMessage`
+### HTTP API (verji-vagent-graph)
+REST API with Server-Sent Events for streaming:
+- `POST /api/v1/process_message`: Send message to LangGraph workflow, returns SSE stream
+- `POST /api/v1/submit_feedback`: Submit HITL feedback
+- `GET /health`: Health check endpoint
+- `GET /docs`: FastAPI Swagger documentation
+
+**Message types** (JSON schemas enforced via Rust structs and Python dataclasses):
+- `BotMessage`, `BotResponse`, `HITLRequest`, `TextMessage`, `StreamChunk`, `ErrorMessage`
 
 ### Verji vAgent Bot Architecture (verji-vagent-bot/)
 Expected modules (refer to [ARCHITECTURE.md](./ARCHITECTURE.md) for detailed examples):
 - `main.rs`: Entry point, Matrix client setup, event loop
+- `types.rs`: Shared JSON message types (serde)
 - `session.rs`: Session management, Redis operations
 - `hitl.rs`: HITL coordination, admin room integration
-- `grpc_client.rs`: gRPC client to verji-vagent-graph service
+- `http_client.rs`: HTTP/SSE client to verji-vagent-graph service
 
 ### Verji vAgent Graph Architecture (verji-vagent-graph/)
 Expected modules:
-- `main.py`: Entry point, gRPC server startup
-- `grpc_server.py`: gRPC server implementation
+- `main.py`: Entry point, FastAPI server startup
+- `types.py`: Shared JSON message types (Pydantic/dataclasses)
+- `api.py`: FastAPI route handlers with SSE streaming
 - `session_manager.py`: Redis session operations
 - `langgraph_workflow.py`: LangGraph workflow definitions with HITL nodes
 
@@ -190,7 +186,7 @@ LangGraph workflows should:
 - Use `State` TypedDict with `session_id`, `messages`, `proposed_action`, `approval`, `final_response`
 - Implement conditional edges to route to HITL approval node for risky actions
 - Use Redis checkpointer: `RedisSaver(session_manager.redis)`
-- Send `HITLRequest` via gRPC when human approval needed
+- Stream `hitl_request` SSE event when human approval needed
 - Wait for feedback via Redis pubsub before resuming
 
 ## Environment Configuration
@@ -206,7 +202,8 @@ Copy `.env.example` to `.env` and configure:
 - `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`: LLM API keys
 
 **Optional:**
-- `GRPC_ENDPOINT`: verji-vagent-graph service endpoint (default: `http://verji-vagent-graph:50051`)
+- `GRAPH_API_ENDPOINT`: verji-vagent-graph service endpoint (default: `http://verji-vagent-graph:8000`)
+- `HTTP_PORT`: Python service port (default: `8000`)
 - `RUST_LOG`: Rust logging level (default: `info,matrix_sdk=warn`)
 - `LOG_LEVEL`: Python logging level (default: `info`)
 
@@ -215,8 +212,8 @@ Copy `.env.example` to `.env` and configure:
 **Services are deployed separately** (not spawned/forked):
 
 ```
-Redis Container ← → verji-vagent-graph Container
-                    ↑ (gRPC)
+Redis Container ← → verji-vagent-graph Container (HTTP :8000)
+                    ↑ (HTTP/JSON + SSE)
                     verji-vagent-bot Container
 ```
 
@@ -228,16 +225,17 @@ Benefits:
 
 **Startup order:**
 1. Redis
-2. verji-vagent-graph (starts gRPC server on `:50051`)
+2. verji-vagent-graph (starts HTTP server on `:8000`)
 3. verji-vagent-bot (connects to verji-vagent-graph and Matrix)
 
 ## Key Technical Details
 
-### gRPC Communication
-- **Bidirectional streaming**: Used for `ProcessMessage` to support HITL flows
-- **Type safety**: Protocol buffers ensure contract between Rust and Python
-- **Connection**: verji-vagent-bot is gRPC client, verji-vagent-graph is gRPC server
-- **Error handling**: Use `ErrorMessage` response type for failures
+### HTTP/JSON Communication
+- **Server-Sent Events (SSE)**: Used for streaming responses including HITL flows
+- **Human-readable**: JSON messages are easy to debug in logs and with `curl`
+- **Connection**: verji-vagent-bot is HTTP client, verji-vagent-graph is HTTP/SSE server
+- **Error handling**: Use standard HTTP status codes and JSON error responses
+- **No code generation**: Direct serde/Pydantic usage for type safety within each service
 
 ### Redis Usage
 1. **Session storage**: Persist session state with TTL
@@ -282,12 +280,13 @@ tilt up  # Start services
 - **Docker Compose for production only**: Use docker-compose.yml for production deployment or testing production builds
 - **Tiltfile is the source of truth**: For local development configuration, refer to the Tiltfile
 - **Never spawn/fork services**: Each service runs independently in its own container
-- **Always regenerate proto**: Run `./scripts/gen-proto.sh` after editing `proto/chatbot.proto` (or click "proto-compile" in Tilt UI)
+- **HTTP/JSON not gRPC**: Services communicate via HTTP/JSON + SSE for simplicity and debuggability
 - **Session ID format**: Always use hierarchical format `room:thread:user`
 - **HITL timeout**: Default 1 hour (3600 seconds), configurable per request
 - **Redis TTL**: Sessions expire after 24 hours of inactivity
 - **Admin room security**: Only process HITL responses from configured `ADMIN_ROOM_ID`
 - **Dockerfile.dev files**: Used by Tilt for hot reload - don't modify regular Dockerfiles for dev
+- **API documentation**: Access FastAPI Swagger docs at `http://localhost:8000/docs` when running
 
 ## Documentation References
 
@@ -327,11 +326,6 @@ tilt up
   - Binary restarts automatically
   - Much faster than full Docker rebuild
 
-- **Protocol changes** (`proto/chatbot.proto`)
-  - Edit the `.proto` file
-  - Click "proto-compile" in Tilt UI
-  - Generated code updates automatically
-
 ### Using Tilt UI
 
 **Resource view** (http://localhost:10350):
@@ -345,13 +339,13 @@ tilt up
 - Search and filter capabilities
 
 **Manual triggers:**
-- **proto-compile**: Regenerate gRPC code
 - **integration-tests**: Run test suite
 - **redis-flush**: Clear all Redis data
+- **api-docs**: Open FastAPI documentation
 
 **Port forwards:**
 - Redis: `localhost:6379`
-- verji-vagent-graph gRPC: `localhost:50051`
+- verji-vagent-graph HTTP: `localhost:8000`
 - verji-vagent-bot metrics: `localhost:8080`
 
 ### End of Day
@@ -387,8 +381,8 @@ tilt up
 
 ## Contributing Guidelines
 
-1. **Architecture decisions**: Refer to [ARCHITECTURE.md](./ARCHITECTURE.md) for rationale behind gRPC, Redis, session management
-2. **Protocol changes**: Update `proto/chatbot.proto` first, then regenerate code
-3. **Error handling**: Always handle Redis connection failures, gRPC timeouts, Matrix API errors
+1. **Architecture decisions**: Refer to [ARCHITECTURE.md](./ARCHITECTURE.md) for rationale behind HTTP/JSON, Redis, session management
+2. **API changes**: Update types in `verji-vagent-bot/src/types.rs` and `verji-vagent-graph/src/types.py` to keep schemas in sync
+3. **Error handling**: Always handle Redis connection failures, HTTP timeouts, Matrix API errors
 4. **Logging**: Use structured logging (Rust: `tracing`, Python: built-in `logging`)
-5. **Type safety**: Leverage Protocol Buffers for cross-service contracts
+5. **Type safety**: Use serde for Rust, Pydantic for Python to enforce JSON schemas
