@@ -78,20 +78,29 @@ impl Responder for VerjiAgentResponder {
             return Ok(ResponderResult::Handled(Some(response)));
         }
 
-        // Send query to vagent-graph via Redis
+        // Send query to vagent-graph via Redis with streaming support
         let mut client_guard = self.redis_client.lock().await;
         let client = client_guard.as_mut().expect("Redis client should be initialized");
 
+        // Define progress callback
+        // TODO: In the future, send these as typing indicators or message edits to Matrix
+        let on_progress = |progress_msg: String| {
+            info!("📊 Progress update: {}", progress_msg);
+            // Future: context.room.typing_notice(true).await
+            // Future: Or send/edit a message in the room
+        };
+
         match client
-            .query(
+            .query_with_streaming(
                 context.message_body.clone(),
                 context.room.room_id().to_string(),
                 context.sender.clone(),
+                on_progress,
             )
             .await
         {
             Ok(response) => {
-                info!("✅ Received response from vagent-graph");
+                info!("✅ Received final response from vagent-graph");
                 Ok(ResponderResult::Handled(Some(response)))
             }
             Err(e) => {

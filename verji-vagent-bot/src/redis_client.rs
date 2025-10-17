@@ -23,7 +23,31 @@ pub struct RequestMetadata {
     pub timestamp: u64,
 }
 
-/// Response received from vagent-graph
+/// Type of message from vagent-graph
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphMessageType {
+    /// Progress notification (streamed during execution)
+    Progress,
+    /// Final response (graph completed successfully)
+    FinalResponse,
+    /// Human-in-the-loop request (graph paused, needs user input)
+    HitlRequest,
+    /// Error occurred during processing
+    Error,
+}
+
+/// Message received from vagent-graph (streaming or final)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphMessage {
+    pub request_id: String,
+    pub message_type: GraphMessageType,
+    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// Legacy response type for backward compatibility
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GraphResponse {
     pub request_id: String,
@@ -31,6 +55,26 @@ pub struct GraphResponse {
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+impl From<GraphMessage> for GraphResponse {
+    fn from(msg: GraphMessage) -> Self {
+        let status = match msg.message_type {
+            GraphMessageType::Error => "error",
+            _ => "success",
+        };
+
+        GraphResponse {
+            request_id: msg.request_id,
+            response: msg.content.clone(),
+            status: status.to_string(),
+            error: if msg.message_type == GraphMessageType::Error {
+                Some(msg.content)
+            } else {
+                None
+            },
+        }
+    }
 }
 
 /// Redis client for communicating with vagent-graph
@@ -60,8 +104,20 @@ impl RedisGraphClient {
         })
     }
 
-    /// Send a query to vagent-graph and wait for response
-    pub async fn query(&mut self, query: String, room_id: String, user_id: String) -> Result<String> {
+    /// Send a query to vagent-graph with streaming support
+    ///
+    /// The on_progress callback is called for each progress notification
+    /// Returns the final response content
+    pub async fn query_with_streaming<F>(
+        &mut self,
+        query: String,
+        room_id: String,
+        user_id: String,
+        on_progress: F,
+    ) -> Result<String>
+    where
+        F: Fn(String) + Send + 'static,
+    {
         let request_id = Uuid::new_v4().to_string();
 
         let request = GraphRequest {
@@ -89,26 +145,47 @@ impl RedisGraphClient {
 
         debug!("Request {} published, waiting for response...", request_id);
 
-        // Subscribe to response channel and wait for our response
-        let response = self
-            .wait_for_response(&request_id)
+        // Subscribe to response channel and wait for final response, calling on_progress for intermediate messages
+        let final_message = self
+            .wait_for_final_response(&request_id, on_progress)
             .await
             .context("Failed to get response from vagent-graph")?;
 
-        if response.status == "error" {
-            warn!(
-                "vagent-graph returned error for request {}: {:?}",
-                request_id, response.error
-            );
-            return Ok(format!("Error: {}", response.error.unwrap_or_else(|| "Unknown error".to_string())));
+        match final_message.message_type {
+            GraphMessageType::Error => {
+                warn!(
+                    "vagent-graph returned error for request {}: {}",
+                    request_id, final_message.content
+                );
+                Ok(format!("Error: {}", final_message.content))
+            }
+            GraphMessageType::FinalResponse | GraphMessageType::HitlRequest => {
+                debug!("Received final response for request {}", request_id);
+                Ok(final_message.content)
+            }
+            GraphMessageType::Progress => {
+                // This shouldn't happen (progress should not be returned as final)
+                warn!("Received progress message as final response");
+                Ok(final_message.content)
+            }
         }
-
-        debug!("Received response for request {}", request_id);
-        Ok(response.response)
     }
 
-    /// Wait for a response with the given request_id
-    async fn wait_for_response(&mut self, request_id: &str) -> Result<GraphResponse> {
+    /// Send a query to vagent-graph and wait for response (legacy method without streaming)
+    pub async fn query(&mut self, query: String, room_id: String, user_id: String) -> Result<String> {
+        // Use streaming method with no-op callback
+        self.query_with_streaming(query, room_id, user_id, |_| {}).await
+    }
+
+    /// Wait for final response, calling on_progress for intermediate progress messages
+    async fn wait_for_final_response<F>(
+        &mut self,
+        request_id: &str,
+        on_progress: F,
+    ) -> Result<GraphMessage>
+    where
+        F: Fn(String) + Send + 'static,
+    {
         // Create a new pubsub connection for listening
         let client = Client::open(self.redis_url.as_str())
             .context("Failed to create Redis client for pubsub")?;
@@ -141,12 +218,46 @@ impl RedisGraphClient {
 
             let payload: String = message.get_payload()?;
 
+            // Try to parse as GraphMessage first (new format)
+            if let Ok(graph_msg) = serde_json::from_str::<GraphMessage>(&payload) {
+                if graph_msg.request_id == request_id {
+                    match graph_msg.message_type {
+                        GraphMessageType::Progress => {
+                            // Call progress callback and continue waiting
+                            info!("📊 Progress: {}", graph_msg.content);
+                            on_progress(graph_msg.content);
+                            continue;
+                        }
+                        GraphMessageType::FinalResponse
+                        | GraphMessageType::HitlRequest
+                        | GraphMessageType::Error => {
+                            // This is the final message, return it
+                            return Ok(graph_msg);
+                        }
+                    }
+                }
+                // Not our message, keep waiting
+                continue;
+            }
+
+            // Fall back to legacy GraphResponse format for backward compatibility
             match serde_json::from_str::<GraphResponse>(&payload) {
                 Ok(response) => {
                     if response.request_id == request_id {
-                        return Ok(response);
+                        // Convert legacy response to GraphMessage
+                        let message_type = if response.status == "error" {
+                            GraphMessageType::Error
+                        } else {
+                            GraphMessageType::FinalResponse
+                        };
+
+                        return Ok(GraphMessage {
+                            request_id: response.request_id,
+                            message_type,
+                            content: response.response,
+                            metadata: None,
+                        });
                     }
-                    // Not our message, keep waiting
                 }
                 Err(e) => {
                     warn!("Failed to parse response from Redis: {}", e);
@@ -155,4 +266,5 @@ impl RedisGraphClient {
             }
         }
     }
+
 }

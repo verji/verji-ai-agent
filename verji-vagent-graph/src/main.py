@@ -54,26 +54,97 @@ class VAgentGraph:
             await self.redis_client.close()
         logger.info("Disconnected from Redis")
 
-    async def process_query(self, query: str, metadata: Dict[str, Any]) -> str:
+    async def emit_progress(self, request_id: str, content: str) -> None:
         """
-        Process a query from vagent-bot.
-
-        For now, this is an echo POC. Later, this will invoke LangGraph.
+        Emit a progress notification for streaming updates.
 
         Args:
+            request_id: The request ID to associate with this progress update
+            content: The progress message content
+        """
+        message = {
+            "request_id": request_id,
+            "message_type": "progress",
+            "content": content,
+        }
+        await self.redis_client.publish(
+            self.response_channel,
+            json.dumps(message),
+        )
+        logger.debug(f"Emitted progress for request {request_id}: {content}")
+
+    async def emit_final_response(self, request_id: str, content: str) -> None:
+        """
+        Emit the final response.
+
+        Args:
+            request_id: The request ID to associate with this response
+            content: The final response content
+        """
+        message = {
+            "request_id": request_id,
+            "message_type": "final_response",
+            "content": content,
+        }
+        await self.redis_client.publish(
+            self.response_channel,
+            json.dumps(message),
+        )
+        logger.info(f"Emitted final response for request {request_id}")
+
+    async def emit_error(self, request_id: str, error_message: str) -> None:
+        """
+        Emit an error response.
+
+        Args:
+            request_id: The request ID to associate with this error
+            error_message: The error message
+        """
+        message = {
+            "request_id": request_id,
+            "message_type": "error",
+            "content": error_message,
+        }
+        await self.redis_client.publish(
+            self.response_channel,
+            json.dumps(message),
+        )
+        logger.error(f"Emitted error for request {request_id}: {error_message}")
+
+    async def process_query(self, request_id: str, query: str, metadata: Dict[str, Any]) -> None:
+        """
+        Process a query from vagent-bot with streaming support.
+
+        This demonstrates progress streaming. In production, this will invoke LangGraph.
+
+        Args:
+            request_id: The request ID for correlation
             query: The user's query text
             metadata: Additional metadata (room_id, user_id, etc.)
-
-        Returns:
-            The response text
         """
         logger.info(f"Processing query: {query}")
         logger.info(f"Metadata: {metadata}")
 
-        # Echo POC: Just return the query with a prefix
-        response = f"[Echo POC] You said: {query}"
+        try:
+            # Simulate multi-step processing with progress updates
+            await self.emit_progress(request_id, "🔍 Analyzing your question...")
+            await asyncio.sleep(0.5)  # Simulate work
 
-        return response
+            await self.emit_progress(request_id, "🧠 Thinking about the best response...")
+            await asyncio.sleep(0.5)  # Simulate work
+
+            await self.emit_progress(request_id, "✍️ Formulating answer...")
+            await asyncio.sleep(0.5)  # Simulate work
+
+            # Echo POC: Return the query with a prefix
+            response = f"[Echo POC with Streaming] You said: {query}"
+
+            # Emit final response
+            await self.emit_final_response(request_id, response)
+
+        except Exception as e:
+            logger.error(f"Error processing query: {e}", exc_info=True)
+            await self.emit_error(request_id, f"Failed to process query: {str(e)}")
 
     async def handle_request(self, message_data: Dict[str, Any]):
         """
@@ -101,36 +172,16 @@ class VAgentGraph:
 
             logger.info(f"Handling request {request_id}")
 
-            # Process the query (echo POC for now)
-            response_text = await self.process_query(query, metadata)
-
-            # Publish response back to vagent-bot
-            response_message = {
-                "request_id": request_id,
-                "response": response_text,
-                "status": "success",
-            }
-
-            await self.redis_client.publish(
-                self.response_channel,
-                json.dumps(response_message),
-            )
-
-            logger.info(f"Published response for request {request_id}")
+            # Process the query with streaming support
+            await self.process_query(request_id, query, metadata)
 
         except Exception as e:
             logger.error(f"Error handling request: {e}", exc_info=True)
-            # Publish error response
-            if self.redis_client and message_data.get("request_id"):
-                error_message = {
-                    "request_id": message_data["request_id"],
-                    "response": "Error processing your request",
-                    "status": "error",
-                    "error": str(e),
-                }
-                await self.redis_client.publish(
-                    self.response_channel,
-                    json.dumps(error_message),
+            # Emit error message
+            if message_data.get("request_id"):
+                await self.emit_error(
+                    message_data["request_id"],
+                    f"Error processing your request: {str(e)}"
                 )
 
     async def run(self):
