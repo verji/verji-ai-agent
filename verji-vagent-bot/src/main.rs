@@ -2,198 +2,37 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use matrix_sdk::{
     config::SyncSettings,
-    encryption::EncryptionSettings,
-    ruma::events::room::message::{MessageType, RoomMessageEventContent, OriginalSyncRoomMessageEvent},
-    Client, EncryptionState, Room,
+    room::Room as MatrixRoom,
+    ruma::events::room::message::{MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent},
+    Client,
 };
-use std::path::PathBuf;
-use tracing::{debug, error, info, warn};
+use std::{path::PathBuf, sync::Arc};
+use tokio::sync::RwLock;
+use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
+mod client;
+mod encryption;
+mod responder;
+mod responder_manager;
+mod responders;
+mod session;
+
+use responder::ResponderContext;
+use responder_manager::ResponderManager;
+use responders::{PingPongResponder, VerjiAgentResponder};
 
 #[derive(Parser, Debug)]
 #[command(name = "verji-vagent-bot")]
-#[command(about = "Verji vAgent Bot - Matrix bot with E2EE support", long_about = None)]
+#[command(about = "Verji vAgent Bot - Matrix bot with pluggable responders and E2EE support", long_about = None)]
 struct Args {
-    /// Clear the store directory before starting (useful for device ID mismatches)
+    /// Clear the store directory before starting
     #[arg(long)]
     clear_store: bool,
 
-    /// Reset all encryption (delete backups, cross-signing, and create fresh keys)
+    /// Reset all encryption (DESTRUCTIVE: creates fresh keys, old encrypted messages may be lost)
     #[arg(long)]
     reset_encryption: bool,
-}
-
-/// Setup encryption keys (cross-signing and backups)
-async fn setup_encryption(client: &Client, store_path: &PathBuf, reset: bool) -> Result<()> {
-    let encryption = client.encryption();
-
-    info!("🔐 Setting up encryption...");
-
-    // If reset is requested, we'll force new keys
-    if reset {
-        info!("🔄 Reset encryption requested - will create fresh keys...");
-        info!("  Note: This will override any existing keys on the server");
-        info!("  Existing backup on server will remain but won't be used");
-        info!("  Will force bootstrap new cross-signing keys and create new recovery key");
-    }
-
-    // Check cross-signing status
-    let cross_signing_status = encryption.cross_signing_status().await;
-
-    match cross_signing_status {
-        Some(status) => {
-            info!("  Cross-signing status: {:?}", status);
-
-            // If cross-signing is not set up OR reset is requested, bootstrap it
-            if reset || !status.has_master || !status.has_self_signing || !status.has_user_signing {
-                if reset {
-                    info!("  Forcing cross-signing bootstrap (reset mode)...");
-                } else {
-                    info!("  Cross-signing keys missing, bootstrapping...");
-                }
-
-                match encryption.bootstrap_cross_signing(None).await {
-                    Ok(_) => {
-                        info!("  ✅ Cross-signing bootstrapped successfully");
-                    }
-                    Err(e) => {
-                        warn!("  ⚠️  Failed to bootstrap cross-signing: {}", e);
-                        info!("     This is non-fatal, encryption will still work");
-                    }
-                }
-            } else {
-                info!("  ✅ Cross-signing already set up");
-            }
-        }
-        None => {
-            info!("  Cross-signing not available");
-        }
-    }
-
-    // Setup key backups and recovery
-    info!("  Setting up key backups and recovery...");
-
-    // Check if recovery is enabled
-    let recovery = encryption.recovery();
-    let state = recovery.state();
-    info!("  Recovery state: {:?}", state);
-
-    // If reset mode or recovery is disabled, try to enable it
-    if reset || state == matrix_sdk::encryption::recovery::RecoveryState::Disabled {
-        if reset {
-            info!("  Creating new recovery and backup (reset mode)...");
-        } else {
-            info!("  Checking for existing backup on server...");
-        }
-
-        // In reset mode, we already deleted the backup above, so just create new one
-        if reset {
-            info!("  Creating fresh backup with new recovery key...");
-
-            match recovery.enable().await {
-                Ok(recovery_key) => {
-                    info!("  ✅ Recovery and backups enabled successfully");
-
-                    // Save recovery key to file
-                    let recovery_key_path = store_path.join("recovery_key.txt");
-                    match std::fs::write(&recovery_key_path, &recovery_key) {
-                        Ok(_) => {
-                            info!("  ✅ Recovery key saved to: {:?}", recovery_key_path);
-                            info!("  🔑 Recovery key: {}", recovery_key);
-                            info!("     ⚠️  IMPORTANT: Save this recovery key securely!");
-                        }
-                        Err(e) => {
-                            warn!("  ⚠️  Failed to save recovery key to file: {}", e);
-                            info!("  🔑 Recovery key: {}", recovery_key);
-                            info!("     ⚠️  IMPORTANT: Save this recovery key securely!");
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("  ⚠️  Failed to enable recovery: {}", e);
-                    info!("     This is non-fatal, encryption will still work");
-                }
-            }
-        } else {
-            // Normal mode - check if backup exists
-            match encryption.backups().exists_on_server().await {
-                Ok(true) => {
-                    info!("  📦 Backup already exists on server");
-                    info!("  Note: Cannot create new recovery key when backup exists");
-                    info!("  This is normal if the account was used before");
-                    info!("  ⚠️  To use existing backup, you need the recovery key from previous setup");
-                    info!("  💡 Tip: Use --reset-encryption to delete old backup and create fresh keys");
-                }
-                Ok(false) => {
-                    info!("  No existing backup found, creating new one...");
-
-                    // Enable recovery with automatic backup
-                    match recovery.enable().await {
-                        Ok(recovery_key) => {
-                            info!("  ✅ Recovery and backups enabled successfully");
-
-                            // Save recovery key to file
-                            let recovery_key_path = store_path.join("recovery_key.txt");
-                            match std::fs::write(&recovery_key_path, &recovery_key) {
-                                Ok(_) => {
-                                    info!("  ✅ Recovery key saved to: {:?}", recovery_key_path);
-                                    info!("  🔑 Recovery key: {}", recovery_key);
-                                    info!("     ⚠️  IMPORTANT: Save this recovery key securely!");
-                                }
-                                Err(e) => {
-                                    warn!("  ⚠️  Failed to save recovery key to file: {}", e);
-                                    info!("  🔑 Recovery key: {}", recovery_key);
-                                    info!("     ⚠️  IMPORTANT: Save this recovery key securely!");
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!("  ⚠️  Failed to enable recovery: {}", e);
-                            info!("     This is non-fatal, encryption will still work");
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("  ⚠️  Failed to check backup status: {}", e);
-                    info!("     Will try to enable recovery anyway...");
-
-                    // Try to enable anyway
-                    match recovery.enable().await {
-                        Ok(recovery_key) => {
-                            info!("  ✅ Recovery enabled");
-                            let recovery_key_path = store_path.join("recovery_key.txt");
-                            let _ = std::fs::write(&recovery_key_path, &recovery_key);
-                            info!("  🔑 Recovery key: {}", recovery_key);
-                        }
-                        Err(e2) => {
-                            warn!("  ⚠️  Could not enable recovery: {}", e2);
-                        }
-                    }
-                }
-            }
-        }
-    } else {
-        info!("  ✅ Recovery already enabled");
-    }
-
-    // Log backup status
-    match encryption.backups().state() {
-        matrix_sdk::encryption::backups::BackupState::Enabled => {
-            info!("  ✅ Backups are enabled");
-        }
-        state => {
-            info!("  Backup state: {:?}", state);
-        }
-    }
-
-    // Log final encryption status
-    info!("🔐 Encryption setup complete:");
-    if let Some(status) = encryption.cross_signing_status().await {
-        info!("  Cross-signing: master={}, self={}, user={}",
-            status.has_master, status.has_self_signing, status.has_user_signing);
-    }
-
-    Ok(())
 }
 
 #[tokio::main]
@@ -209,12 +48,21 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    info!("🤖 Starting Verji vAgent Bot (POC - Echo Mode with E2EE)");
+    info!("🤖 Starting Verji vAgent Bot with Pluggable Responder Pattern");
     info!("Version: {}", env!("CARGO_PKG_VERSION"));
 
-    // Load environment variables from .env file
+    // Show warning if reset_encryption is enabled
+    if args.reset_encryption {
+        warn!("⚠️  ⚠️  ⚠️  DESTRUCTIVE MODE: --reset-encryption enabled ⚠️  ⚠️  ⚠️");
+        warn!("This will create FRESH encryption keys!");
+        warn!("Old encrypted messages may become UNREADABLE!");
+        warn!("Waiting 3 seconds... Press Ctrl+C to abort.");
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        warn!("Proceeding with encryption reset...");
+    }
+
+    // Load environment variables
     dotenvy::dotenv().ok();
-    debug!("Environment variables loaded");
 
     // Get Matrix credentials from environment
     let homeserver = std::env::var("MATRIX_HOMESERVER")
@@ -223,50 +71,23 @@ async fn main() -> Result<()> {
         .context("MATRIX_USER environment variable not set")?;
     let password = std::env::var("MATRIX_PASSWORD")
         .context("MATRIX_PASSWORD environment variable not set")?;
-
-    // Get optional store path for session persistence
     let store_path = std::env::var("MATRIX_STORE_PATH")
         .unwrap_or_else(|_| "./matrix_store".to_string());
+    let store_passphrase = password.clone();
 
     info!("Configuration:");
     info!("  Homeserver: {}", homeserver);
     info!("  Username: {}", username);
     info!("  Store path: {}", store_path);
 
-    // Create store path if it doesn't exist
     let store_path_buf = PathBuf::from(&store_path);
 
     // Clear store if requested
     if args.clear_store {
-        if store_path_buf.exists() {
-            info!("🗑️  Clearing store directory as requested: {}", store_path);
-
-            // Try to remove, with retries for Windows file locking issues
-            let mut retries = 3;
-            loop {
-                match std::fs::remove_dir_all(&store_path_buf) {
-                    Ok(_) => {
-                        info!("✅ Store directory cleared");
-                        break;
-                    }
-                    Err(e) if retries > 0 => {
-                        warn!("  ⚠️  Failed to clear store (retrying...): {}", e);
-                        retries -= 1;
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                    }
-                    Err(e) => {
-                        return Err(e).context("Failed to remove store directory after retries");
-                    }
-                }
-            }
-
-            // Small delay to ensure filesystem sync on Windows
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        } else {
-            info!("🗑️  Store directory doesn't exist, nothing to clear");
-        }
+        client::clear_store(&store_path_buf).await?;
     }
 
+    // Create store directory if needed
     if !store_path_buf.exists() {
         info!("Creating store directory: {}", store_path);
         std::fs::create_dir_all(&store_path_buf)
@@ -275,97 +96,127 @@ async fn main() -> Result<()> {
 
     info!("🔌 Connecting to homeserver: {}", homeserver);
 
-    // Create Matrix client with session persistence and encryption
-    let client = Client::builder()
-        .homeserver_url(&homeserver)
-        .sqlite_store(&store_path_buf, None)
-        .with_encryption_settings(EncryptionSettings {
-            auto_enable_cross_signing: true,
-            backup_download_strategy: matrix_sdk::encryption::BackupDownloadStrategy::AfterDecryptionFailure,
-            auto_enable_backups: true,
-        })
-        .build()
-        .await
-        .context("Failed to create Matrix client")?;
+    // Session file path
+    let session_file = store_path_buf.join("session.json");
 
-    debug!("Matrix client created successfully");
-
-    // Check if we have a valid session already
-    let session_source = if client.user_id().is_some() {
-        info!("🔄 Found existing session in store");
-        if let Some(user_id) = client.user_id() {
-            info!("  User ID: {}", user_id);
-        }
-        if let Some(device_id) = client.device_id() {
-            info!("  Device ID: {}", device_id);
-        }
-        info!("  Session source: Restored from persistent storage");
-        "restored"
+    // Try to restore session or login fresh
+    let (client, session_source) = if session_file.exists() && !args.clear_store {
+        client::restore_or_login(
+            &session_file,
+            &homeserver,
+            &username,
+            &password,
+            &store_path_buf,
+            &store_passphrase,
+        )
+        .await?
     } else {
-        // No session found, need to login
-        info!("🔐 No existing session found, logging in as: {}", username);
-
-        match client
-            .matrix_auth()
-            .login_username(&username, &password)
-            .initial_device_display_name("Verji vAgent Bot")
-            .await
-        {
-            Ok(_) => {
-                info!("✅ Successfully logged in");
-                if let Some(user_id) = client.user_id() {
-                    info!("  User ID: {}", user_id);
-                }
-                if let Some(device_id) = client.device_id() {
-                    info!("  Device ID: {}", device_id);
-                }
-                info!("  Session persisted to: {}", store_path);
-                info!("  Session source: New login");
-                "new_login"
-            }
-            Err(e) => {
-                // Check if this is a device mismatch error
-                let error_msg = e.to_string();
-                if error_msg.contains("doesn't match the account in the constructor")
-                    || error_msg.contains("account in the store doesn't match") {
-                    error!("❌ Device ID mismatch detected in crypto store");
-                    error!("   This usually happens when the store contains a different device");
-                    error!("   Suggested fix: Run with --clear-store flag or delete the store directory");
-                    error!("   Store path: {}", store_path);
-                    error!("   Command: cargo run -- --clear-store");
-                    return Err(e).context("Crypto store device mismatch - run with --clear-store flag");
-                } else {
-                    return Err(e).context("Failed to login");
-                }
-            }
-        }
+        client::fresh_login(
+            &homeserver,
+            &username,
+            &password,
+            &store_path,
+            &store_path_buf,
+            &store_passphrase,
+            &session_file,
+        )
+        .await?
     };
 
-    info!("📊 Session Status Summary:");
+    info!("📊 Session Status:");
     info!("  Source: {}", session_source);
     if let Some(user_id) = client.user_id() {
-        info!("  Active User: {}", user_id);
+        info!("  User ID: {}", user_id);
     }
     if let Some(device_id) = client.device_id() {
-        info!("  Active Device: {}", device_id);
+        info!("  Device ID: {}", device_id);
     }
 
-    // Setup encryption (cross-signing and backups)
-    setup_encryption(&client, &store_path_buf, args.reset_encryption).await?;
+    // Setup/reset encryption if explicitly requested
+    if args.reset_encryption {
+        info!("🔐 Resetting encryption as requested");
+        encryption::setup_encryption(&client, &store_path_buf, true, &password).await?;
 
-    // Register event handler for room messages
+        // Perform initial sync after encryption reset to stabilize SDK state
+        info!("🔄 Performing initial sync after encryption reset...");
+        let initial_sync_settings = SyncSettings::default()
+            .timeout(std::time::Duration::from_secs(30));
+
+        match client.sync_once(initial_sync_settings).await {
+            Ok(_) => {
+                info!("✅ Initial sync after reset completed");
+                encryption::log_encryption_status(&client, "after reset sync").await;
+            }
+            Err(e) => {
+                warn!("⚠️  Initial sync after reset failed: {}", e);
+            }
+        }
+    } else {
+        encryption::log_encryption_status(&client, "before sync").await;
+    }
+
+    // Initialize responder manager
+    let responder_manager = Arc::new(RwLock::new(ResponderManager::new()));
+
+    // Register responders (priority order: PingPong=100, VerjiAgent=10)
+    info!("📝 Registering responders...");
+    {
+        let mut manager = responder_manager.write().await;
+        manager.register(Arc::new(PingPongResponder::new()));
+        manager.register(Arc::new(VerjiAgentResponder::new()));
+    }
+
+    info!(
+        "✅ Registered {} responders",
+        responder_manager.read().await.count()
+    );
+
+    // Register event handler with responder manager
+    let responder_manager_clone = Arc::clone(&responder_manager);
+    let client_clone = client.clone();
+
     client.add_event_handler(
-        |event: OriginalSyncRoomMessageEvent, room: Room| async move {
-            on_room_message(event, room).await;
+        move |event: OriginalSyncRoomMessageEvent, room: MatrixRoom| {
+            let responder_manager = Arc::clone(&responder_manager_clone);
+            let client = client_clone.clone();
+
+            async move {
+                if let Err(e) = handle_message(event, room, responder_manager, client).await {
+                    error!("Error handling message: {}", e);
+                }
+            }
         },
     );
 
     info!("📨 Event handlers registered");
-    info!("🔄 Starting sync loop...");
-    info!("Bot is now running and ready to echo messages");
 
-    // Start syncing with full state to ensure we get room encryption info
-    let sync_settings = SyncSettings::default().full_state(true);
+    // Perform initial sync for new logins to set up encryption
+    if session_source == "new_login" {
+        info!("🔄 Performing initial sync for new login...");
+        let initial_sync_settings = SyncSettings::default()
+            .timeout(std::time::Duration::from_secs(10));
+
+        match client.sync_once(initial_sync_settings).await {
+            Ok(_) => {
+                info!("✅ Initial sync completed");
+                encryption::log_encryption_status(&client, "after initial sync").await;
+
+                // Setup backups for new login
+                if let Err(e) = encryption::setup_backup_only(&client, &store_path_buf).await {
+                    warn!("⚠️  Failed to set up backups: {}", e);
+                }
+            }
+            Err(e) => {
+                warn!("⚠️  Initial sync failed: {}", e);
+            }
+        }
+    }
+
+    info!("🔄 Starting main sync loop...");
+    info!("Bot is now running and ready to respond");
+
+    // Start continuous syncing
+    let sync_settings = SyncSettings::default();
 
     match client.sync(sync_settings).await {
         Ok(_) => {
@@ -379,97 +230,62 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Event handler for room messages
-async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
-    let room_id = room.room_id();
-    let sender = &event.sender;
-    let content = &event.content;
-    let own_user_id = room.own_user_id();
-
-    // Log room information
-    let room_name = room.display_name().await.ok();
-    debug!(
-        room_id = %room_id,
-        room_name = ?room_name,
-        "Processing message event"
-    );
-
-    // Check if room is encrypted (matrix-sdk 0.14+ uses EncryptionState enum)
-    let encryption_state = room.encryption_state();
-    let is_encrypted = matches!(encryption_state, EncryptionState::Encrypted);
-    debug!(
-        room_id = %room_id,
-        encryption_state = ?encryption_state,
-        is_encrypted = is_encrypted,
-        "Room encryption status"
-    );
-
-    // Ignore messages from ourselves to prevent echo loops
-    if sender == own_user_id {
-        debug!(
-            room_id = %room_id,
-            "Ignoring message from self"
-        );
-        return;
-    }
-
-    // Extract message content
-    let MessageType::Text(text_content) = &content.msgtype else {
-        debug!(
-            room_id = %room_id,
-            message_type = ?content.msgtype,
-            "Ignoring non-text message"
-        );
-        return;
+/// Handle incoming message by routing through responder manager
+async fn handle_message(
+    event: OriginalSyncRoomMessageEvent,
+    room: MatrixRoom,
+    responder_manager: Arc<RwLock<ResponderManager>>,
+    client: Client,
+) -> Result<()> {
+    // Only handle text messages
+    let MessageType::Text(text_content) = event.content.msgtype else {
+        return Ok(());
     };
 
-    let message_body = &text_content.body;
+    let sender = event.sender.to_string();
+    let message_body = text_content.body.clone();
 
-    info!(
-        room_id = %room_id,
-        sender = %sender,
-        is_encrypted = is_encrypted,
-        message_len = message_body.len(),
-        "📥 Received message: {}",
-        message_body
-    );
-
-    // Echo the message back
-    let echo_content = RoomMessageEventContent::text_plain(format!(
-        "Echo: {}",
-        message_body
-    ));
-
-    debug!(
-        room_id = %room_id,
-        is_encrypted = is_encrypted,
-        "Sending echo response"
-    );
-
-    match room.send(echo_content).await {
-        Ok(_response) => {
-            info!(
-                room_id = %room_id,
-                is_encrypted = is_encrypted,
-                "✅ Successfully sent echo to room"
-            );
-        }
-        Err(e) => {
-            error!(
-                room_id = %room_id,
-                error = %e,
-                error_debug = ?e,
-                is_encrypted = is_encrypted,
-                "❌ Failed to send echo message"
-            );
-
-            // Log additional context for encryption errors
-            if is_encrypted {
-                warn!(
-                    room_id = %room_id,
-                    "Failed to send to encrypted room - may need key verification"
-                );
-            }
+    // Ignore bot's own messages
+    if let Some(user_id) = client.user_id() {
+        if sender == user_id.to_string() {
+            return Ok(());
         }
     }
+
+    // Detect if bot was mentioned
+    let bot_user_id = client.user_id().map(|u| u.to_string()).unwrap_or_default();
+    let is_direct_mention = message_body.contains(&bot_user_id)
+        || message_body.to_lowercase().contains("vagent");
+
+    info!("📨 Received message: {}", message_body);
+
+    // Build context
+    let manager = responder_manager.read().await;
+    let registered_responders = manager.list_responders();
+
+    let context = ResponderContext {
+        client: client.clone(),
+        room: room.clone(),
+        sender,
+        message_body,
+        is_direct_mention,
+        registered_responders,
+    };
+
+    // Process through responder manager
+    if let Some(response) = manager.process_message(&context).await? {
+        let content = RoomMessageEventContent::text_plain(&response);
+
+        // Spawn the send operation in a separate task to avoid potential recursion issues
+        // when encryption state has been reset
+        let room_clone = room.clone();
+        tokio::spawn(async move {
+            match room_clone.send(content).await {
+                Ok(_) => info!("✅ Sent response"),
+                Err(e) => error!("Failed to send response: {}", e),
+            }
+        });
+    }
+
+    Ok(())
 }

@@ -42,6 +42,9 @@ RUST_LOG=verji_vagent_bot=debug cargo run
 
 # Clear store and start fresh (useful for device ID mismatch errors)
 cargo run -- --clear-store
+
+# ⚠️ DESTRUCTIVE: Reset encryption (creates fresh keys, old messages may be unreadable)
+cargo run -- --clear-store --reset-encryption
 ```
 
 ### Troubleshooting
@@ -57,6 +60,24 @@ cargo run -- --clear-store
 rm -rf ./matrix_store  # or your custom MATRIX_STORE_PATH
 cargo run
 ```
+
+**Backup Already Exists Error:**
+If the bot can't create new encryption keys because a backup already exists from a previous device:
+
+```bash
+# ⚠️ WARNING: This is DESTRUCTIVE and will create fresh keys
+# Old encrypted messages may become unreadable!
+# Use only if you've lost your old recovery key
+cargo run -- --clear-store --reset-encryption
+```
+
+**What `--reset-encryption` does:**
+- ⚠️ **DESTRUCTIVE OPERATION**
+- Forces creation of fresh cross-signing keys
+- Creates a new recovery key (saved to `matrix_store/recovery_key.txt`)
+- Overrides existing keys on the server
+- **Old encrypted messages may become unreadable**
+- Use only if you've lost access to old recovery keys
 
 ## Testing
 
