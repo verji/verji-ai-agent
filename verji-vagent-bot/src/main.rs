@@ -188,11 +188,34 @@ async fn main() -> Result<()> {
     let store_path_buf = PathBuf::from(&store_path);
 
     // Clear store if requested
-    if args.clear_store && store_path_buf.exists() {
-        info!("🗑️  Clearing store directory as requested: {}", store_path);
-        std::fs::remove_dir_all(&store_path_buf)
-            .context("Failed to remove store directory")?;
-        info!("✅ Store directory cleared");
+    if args.clear_store {
+        if store_path_buf.exists() {
+            info!("🗑️  Clearing store directory as requested: {}", store_path);
+
+            // Try to remove, with retries for Windows file locking issues
+            let mut retries = 3;
+            loop {
+                match std::fs::remove_dir_all(&store_path_buf) {
+                    Ok(_) => {
+                        info!("✅ Store directory cleared");
+                        break;
+                    }
+                    Err(e) if retries > 0 => {
+                        warn!("  ⚠️  Failed to clear store (retrying...): {}", e);
+                        retries -= 1;
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    Err(e) => {
+                        return Err(e).context("Failed to remove store directory after retries");
+                    }
+                }
+            }
+
+            // Small delay to ensure filesystem sync on Windows
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        } else {
+            info!("🗑️  Store directory doesn't exist, nothing to clear");
+        }
     }
 
     if !store_path_buf.exists() {
