@@ -6,10 +6,12 @@
 ## Overview
 
 Verji AI Agent is a production-ready Matrix chatbot that combines:
-- **Verji vAgent Bot** (Rust + matrix-rust-sdk): Matrix client for message handling and HITL coordination
-- **Verji vAgent Graph** (Python + LangGraph): AI workflow orchestration with LLM integration
-- **Redis**: Shared state store for sessions, checkpoints, and pubsub
+- **Verji vAgent Bot** (Rust + matrix-rust-sdk): Matrix client for message handling, RBAC enforcement, and HITL coordination
+- **Verji vAgent Graph** (Python + LangGraph): AI workflow orchestration with LLM integration and fine-grained access control
+- **Redis**: Shared state store for sessions, checkpoints, and HITL tracking
 - **HTTP/JSON**: Simple, debuggable communication between services
+- **AccessControlProvider**: External RBAC service for authentication and authorization
+- **Credential Registry**: User-specific credentials for external tools
 
 ## System Architecture
 
@@ -18,7 +20,7 @@ graph TD
     A[Matrix Server<br/>Matrix /sync API]
     B[Verji vAgent Bot Service<br/>matrix-rust-sdk<br/>━━━━━━━━━━━━━━━━━<br/>• Matrix event handling<br/>• Session ID management<br/>• HITL coordination<br/>• Message routing]
     C[Verji vAgent Graph<br/>LangGraph Service<br/>━━━━━━━━━━━━━━━━━<br/>• LangGraph workflow execution<br/>• LLM orchestration<br/>• HITL node handling<br/>• State persistence]
-    D[(Redis<br/>━━━━━━━━━━━━━━━━━<br/>• Session state storage<br/>• LangGraph checkpoints<br/>• HITL pubsub channels<br/>• Message history/context)]
+    D[(Redis<br/>━━━━━━━━━━━━━━━━━<br/>• Session state storage<br/>• LangGraph checkpoints<br/>• HITL pending tracking<br/>• Message history/context)]
 
     A -->|Matrix Client-Server Protocol| B
     B -->|HTTP/JSON + SSE streaming| C
@@ -214,46 +216,406 @@ impl SessionId {
 
 **Session keys:**
 - `session:{session_id}` - Session state (TTL: 24 hours)
-- `hitl_pending:{session_id}` - HITL requests awaiting response
-- `hitl:{session_id}` - Pubsub channel for HITL feedback
+- `checkpoint:{thread_id}:{checkpoint_id}` - LangGraph checkpoints
+- `hitl_pending:{session_id}` - HITL requests awaiting user response
 
 ---
 
-## 3. Human-in-the-Loop (HITL) Pattern
+## 3. Role-Based Access Control (RBAC)
+
+### Overview
+
+Verji AI Agent implements multi-layer RBAC to control access to agents, tools, and documents. Access control is enforced at multiple points:
+
+1. **Bot Layer**: Coarse-grained agent access (can user interact with this agent?)
+2. **Graph Layer**: Fine-grained tool and document access (which tools/docs can user access?)
+3. **Tool Layer**: Internal tool-specific access control
+4. **RAG Layer**: Document-level filtering based on user permissions
+
+### AccessControlProvider Integration
+
+**External Service**: AccessControlProvider authenticates users and produces `AcContext`.
+
+**AcContext Structure** (C# representation):
+```csharp
+public class AcContext {
+    public string? UserId { get; set; }
+    public string ActiveAclDomain { get; set; }         // Tenant/domain
+    public string[]? ActiveRoles { get; private set; }  // Roles for this context
+    public string[] SuperuserGroups { get; private set; }
+    public IDictionary<string, AclRoleItem[]> Roles { get; set; }
+
+    // Methods:
+    // bool HasRole(string roleName, string instanceId, string? domain)
+    // string[] GetInstancesForRoles(string[]? roles)
+    // bool IsSuperUser()
+}
+
+public class AclRoleItem {
+    public string Name { get; set; }          // Role name (e.g., "analyst")
+    public string[] Instances { get; set; }   // Resource instances user can access
+}
+```
+
+**Key Points:**
+- `ActiveRoles` must be used for all access decisions (not all roles in context)
+- `Instances` contains resource IDs like `"agent:verji_ai_agent"`, `"tool:database_query"`, `"document:doc_123"`
+- AccessControlProvider handles its own caching (no caching in our services)
+- Domain/tenant is derived from Matrix room (stored in custom state event)
+
+### Resource Naming Conventions
+
+Resources are identified by instance IDs in the format `{type}:{identifier}`:
+
+| Resource Type | Format | Example | Usage |
+|---------------|--------|---------|-------|
+| **Agent** | `agent:{name}` | `agent:verji_ai_agent` | Entry point access control |
+| **Tool** | `tool:{name}` | `tool:database_query` | Tool invocation permission |
+| **Document (ID)** | `document:{id}` | `document:doc_123` | Specific document access |
+| **Document (Category)** | `document_category:{cat}` | `document_category:finance` | Category-based access |
+| **Document (Tag)** | `document_tag:{tag}` | `document_tag:confidential` | Tag-based access |
+| **Entity (ID)** | `entity:{id}` | `entity:customer_456` | GraphRAG specific entity |
+| **Entity (Type)** | `entity_type:{type}` | `entity_type:customer` | GraphRAG entity type |
+
+**Scalability**: Support both individual IDs and categories/tags to balance granularity with scale.
+
+---
+
+### RBAC Enforcement Layers
+
+#### Layer 1: Bot (verji-vagent-bot) - Agent Access
+
+**Responsibility**: Coarse-grained agent-level authorization
+
+**Flow**:
+1. Extract `user_id` from Matrix event
+2. Derive `domain` (tenant) from Matrix room state event
+3. Call `AccessControlProvider.authenticate(user_id, domain)` → Get `AcContext`
+4. Check: Does user have any role on `agent:verji_ai_agent`?
+   ```rust
+   let allowed_instances = ac_context.GetInstancesForRoles(ac_context.ActiveRoles);
+   if !allowed_instances.contains("agent:verji_ai_agent") {
+       // SILENT DENIAL - Don't respond to user
+       return;
+   }
+   ```
+5. If authorized: Forward to Graph with full `AcContext` in request body
+
+**Error Handling**:
+- Access denied → **Silent denial** (bot doesn't respond)
+- AccessControlProvider unavailable → Fail closed (deny access)
+
+---
+
+#### Layer 2: Graph (verji-vagent-graph) - Tool & Document Access
+
+**Responsibility**: Fine-grained authorization for tools and documents
+
+**Enforcement Points**:
+
+**A. Tool Filtering (Before LLM Planning)**
+
+Filter tools BEFORE LLM sees them to prevent unauthorized tool suggestions:
+
+```python
+def get_available_tools(ac_context: AcContext) -> List[Tool]:
+    """Only return tools user can access"""
+    allowed_instances = ac_context.GetInstancesForRoles(ac_context.ActiveRoles)
+    allowed_tool_ids = [inst for inst in allowed_instances if inst.startswith("tool:")]
+
+    # Filter from ALL_TOOLS registry
+    return [tool for tool in ALL_TOOLS if f"tool:{tool.name}" in allowed_tool_ids]
+
+# In planning node:
+available_tools = get_available_tools(state["ac_context"])
+llm_response = await llm.invoke(messages, tools=available_tools)  # Filtered!
+```
+
+**Benefits**:
+- LLM never suggests tools user can't use
+- Better UX (no "access denied" after suggestion)
+- Security: Tool names/descriptions not leaked
+
+**B. Tool Invocation Authorization (Defense in Depth)**
+
+Double-check before invoking (should never fail if filtering works):
+
+```python
+async def tool_invocation_node(state: State) -> State:
+    tool_name = state["selected_tool"]
+    allowed_instances = state["ac_context"].GetInstancesForRoles(state["ac_context"].ActiveRoles)
+
+    if f"tool:{tool_name}" not in allowed_instances:
+        logger.error("SECURITY: Tool invocation without access")
+        state["error"] = "Access denied"
+        return state
+
+    # Proceed with invocation...
+```
+
+**C. Document Filtering for RAG**
+
+Filter documents by IDs, categories, and tags:
+
+```python
+def extract_doc_identifiers(allowed_instances: List[str]) -> dict:
+    """Extract document access from AcContext instances"""
+    doc_ids, categories, tags = [], [], []
+
+    for inst in allowed_instances:
+        if inst.startswith("document:"):
+            doc_ids.append(inst.replace("document:", ""))
+        elif inst.startswith("document_category:"):
+            categories.append(inst.replace("document_category:", ""))
+        elif inst.startswith("document_tag:"):
+            tags.append(inst.replace("document_tag:", ""))
+
+    return {"doc_ids": doc_ids, "categories": categories, "tags": tags}
+
+def build_doc_filter(identifiers: dict) -> dict:
+    """Build vector store filter with OR logic"""
+    conditions = []
+
+    if identifiers["doc_ids"]:
+        conditions.append({"doc_id": {"$in": identifiers["doc_ids"]}})
+    if identifiers["categories"]:
+        conditions.append({"category": {"$in": identifiers["categories"]}})
+    if identifiers["tags"]:
+        conditions.append({"tags": {"$in": identifiers["tags"]}})
+
+    return {"$or": conditions} if conditions else {"doc_id": {"$in": []}}
+
+# In RAG node:
+identifiers = extract_doc_identifiers(state["ac_context"].GetInstancesForRoles(...))
+results = vector_store.similarity_search(query, filter=build_doc_filter(identifiers))
+```
+
+**Vector Store Metadata**:
+```python
+{
+  "doc_id": "doc_123",
+  "category": "finance",
+  "tags": ["quarterly", "confidential"]
+}
+```
+
+---
+
+#### Layer 3: Credential Registry
+
+**New Service**: Provides user-specific credentials for external tools
+
+**Purpose**: Tools that need external API keys or access tokens
+
+**Interface**:
+```
+POST /api/v1/credentials/get
+Request: {"user_id": "@user:matrix.org", "resource_id": "tool:database_query", "domain": "company_tenant"}
+Response: {"credential_type": "api_key", "credential": "sk_live_...", "expires_at": "..."}
+
+Error Responses:
+- 404: No credentials configured
+- 403: User not authorized
+```
+
+**Integration**:
+```python
+async def tool_invocation_node(state: State) -> State:
+    tool_name = state["selected_tool"]
+
+    if tool_requires_credentials(tool_name):
+        credentials = await credential_registry.get_credentials(
+            user_id=state["user_id"],
+            resource_id=f"tool:{tool_name}",
+            domain=state["domain"]
+        )
+        result = await invoke_tool(tool_name, args, credentials)
+    else:
+        result = await invoke_tool(tool_name, args)
+```
+
+**Credential Types Supported**:
+- `api_key` - Simple API keys
+- `bearer_token` - OAuth bearer tokens
+- `basic_auth` - Username/password
+- `jwt` - Internal Verji JWT tokens
+- `custom` - Tool-specific formats
+
+**Caching**: Credential Registry can use Redis for caching with TTL based on expiry
+
+---
+
+### GraphRAG Entity Access (Future)
+
+Apply same pattern as documents:
+
+```python
+def extract_entity_identifiers(allowed_instances: List[str]) -> dict:
+    """Extract entity access rules"""
+    entity_ids, entity_types, tags = [], [], []
+
+    for inst in allowed_instances:
+        if inst.startswith("entity:"):
+            entity_ids.append(inst.replace("entity:", ""))
+        elif inst.startswith("entity_type:"):
+            entity_types.append(inst.replace("entity_type:", ""))
+        elif inst.startswith("entity_tag:"):
+            tags.append(inst.replace("entity_tag:", ""))
+
+    return {"entity_ids": entity_ids, "entity_types": entity_types, "tags": tags}
+
+# Filter knowledge graph nodes
+def filter_graph(graph, identifiers):
+    accessible_nodes = [
+        node for node, attrs in graph.nodes(data=True)
+        if (node in identifiers["entity_ids"] or
+            attrs.get("entity_type") in identifiers["entity_types"] or
+            any(tag in identifiers["tags"] for tag in attrs.get("tags", [])))
+    ]
+    return graph.subgraph(accessible_nodes)
+```
+
+---
+
+### Audit Logging
+
+Log all access decisions:
+
+```python
+@dataclass
+class AuditEvent:
+    timestamp: datetime
+    user_id: str
+    session_id: str
+    event_type: str  # "agent_access", "tool_access", "rag_query", "access_denied"
+    resource: str
+    decision: str    # "allowed", "denied"
+    metadata: dict
+
+# Log to structured logs + Redis stream
+await audit_log(AuditEvent(
+    timestamp=datetime.now(),
+    user_id="@user:matrix.org",
+    session_id=session_id,
+    event_type="tool_access",
+    resource="tool:database_query",
+    decision="allowed",
+    metadata={"tool_args": {...}}
+))
+```
+
+---
+
+### Key RBAC Design Decisions
+
+| Aspect | Decision | Rationale |
+|--------|----------|-----------|
+| **Agent access** | Enforced in Bot | Fail fast, silent denial, protect Graph |
+| **Tool filtering** | Before LLM planning | LLM never sees unavailable tools |
+| **Tool invocation** | Defense in depth check | Extra security layer |
+| **Document access** | IDs + categories + tags | Scalable, flexible granularity |
+| **AcContext caching** | AccessControlProvider only | Avoid dual caching, no staleness |
+| **AcContext passing** | Bot → Graph via HTTP body | Single fetch, always fresh |
+| **Credentials** | Separate Credential Registry | Clean separation of concerns |
+| **ActiveRoles** | Always use for decisions | AcContext may contain irrelevant roles |
+| **SuperUser** | Bypasses all checks | Reflected in roles/permissions |
+| **Domain/Tenant** | From Matrix room state event | Tenant isolation |
+
+---
+
+## 4. Human-in-the-Loop (HITL) Pattern
+
+### Overview
+
+HITL (Human-in-the-Loop) allows the agent to ask the **same user** for clarification, confirmation, or additional input during workflow execution. The user's response resumes the workflow from a checkpoint.
+
+**Use Cases**:
+- Confirmation: "Confirm delete 1000 records? (yes/no)"
+- Clarification: "Which database? (production/staging)"
+- Additional input: "What date range? (YYYY-MM-DD to YYYY-MM-DD)"
+
+**Key Point**: HITL asks the **user in the same room**, not a third-party admin.
 
 ### HITL Workflow
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant User as 👤 Matrix Room (User)
+    participant User as 👤 User
     participant Bot as 🤖 Verji vAgent Bot
     participant Graph as 🧠 Verji vAgent Graph
-    participant Admin as 👨‍💼 Matrix Admin Room
-    participant Redis as 💾 Redis Pubsub
+    participant Redis as 💾 Redis
 
-    User->>+Bot: "Help me with X"
-    Note over Bot: Receive message event<br/>Extract session_id
-    Bot->>+Graph: POST /api/v1/process_message
-    Note over Graph: Load graph state from Redis<br/>Execute LangGraph nodes<br/>Reach HITL node → pause graph
-    Graph-->>-Bot: SSE: hitl_request event
-    Note over Bot: Receive HITLRequest<br/>Post question to admin room<br/>Subscribe to Redis pubsub
-    Bot->>+Admin: ❓ Approval needed: Delete records?
-    Admin-->>-Bot: ❌ no - too risky
-    Note over Bot: Parse admin response
-    Bot->>Redis: Publish feedback to hitl:{session_id}
-    Bot->>+Graph: POST /api/v1/submit_feedback
-    Note over Graph: Receive feedback<br/>Resume from checkpoint<br/>Update state<br/>Complete workflow
-    Graph-->>-Bot: JSON: Success response
-    Bot-->>-User: ✅ Send final reply
+    User->>+Bot: "Delete old customer records"
+    Note over Bot: Get AcContext<br/>Check agent access
+    Bot->>+Graph: POST /api/v1/process_message<br/>(includes AcContext)
+
+    Note over Graph: LangGraph workflow<br/>Plans: Delete 1000 records<br/>Needs confirmation
+    Note over Graph: HITL node reached
+    Graph->>Redis: Save checkpoint
+    Graph-->>Bot: SSE: hitl_request<br/>"Confirm delete 1000 records?"
+    Graph-->>-Bot: SSE: done (close stream)
+
+    Note over Bot: Store HITL state in Redis<br/>hitl_pending:{session_id}
+    Bot-->>-User: "❓ Confirm delete 1000 records? (yes/no)"
+
+    Note over User: User thinks...<br/>(seconds or minutes)
+
+    User->>+Bot: "yes"
+    Note over Bot: Check Redis: Is HITL pending?<br/>Yes → This is HITL response
+    Bot->>Redis: Delete hitl_pending:{session_id}
+
+    Bot->>+Graph: POST /api/v1/submit_feedback<br/>{session_id, response: "yes"}
+    Note over Graph: Load checkpoint<br/>Resume at HITL node<br/>Execute deletion
+    Graph-->>-Bot: SSE: text_final<br/>"Deleted 1000 records"
+
+    Bot-->>-User: "Deleted 1000 records ✓"
 ```
 
 ### Key HITL Implementation Details
 
-1. **Timeout**: Default 1 hour (configurable per request)
-2. **Redis Pubsub**: Coordinates async feedback between services
-3. **LangGraph Checkpoints**: Enable workflow resumption after HITL
-4. **Admin Room**: Configured via `ADMIN_ROOM_ID` environment variable
+**1. Checkpoint and Resume Pattern**
+
+Graph checkpoints workflow state when HITL is reached, then **exits** (doesn't block). Bot resumes workflow later via `/submit_feedback` endpoint.
+
+**Benefits**:
+- ✅ No resources held during user wait
+- ✅ Scales to hours/days of wait time
+- ✅ User can respond at their convenience
+
+**2. Detecting HITL Responses in Bot**
+
+Bot checks Redis `hitl_pending:{session_id}` on every message to determine if user's message is:
+- A) New query for agent
+- B) Response to pending HITL question
+
+```rust
+// Pseudocode
+if let Some(pending_hitl) = redis.get(f"hitl_pending:{session_id}") {
+    // This is HITL response
+    validate_and_submit_feedback(message, pending_hitl);
+} else {
+    // This is new query
+    process_as_new_message(message);
+}
+```
+
+**3. HITL Request Storage**
+
+Redis key: `hitl_pending:{session_id}`
+- Contains: question, options (if any), timeout
+- TTL: HITL timeout (default 1 hour)
+- Deleted after user responds or timeout
+
+**4. Validation**
+
+If HITL has predefined options (e.g., `["yes", "no"]`), Bot validates user response. Invalid response → Ask again.
+
+**5. Timeout Handling**
+
+After timeout (Redis TTL expires):
+- User's next message treated as new query
+- Workflow must be restarted from scratch
 
 ---
 
@@ -322,9 +684,11 @@ graph TB
 
 ### Infrastructure
 
-- **Redis 7**: Session state, checkpoints, HITL pubsub
+- **Redis 7**: Session state, checkpoints, HITL tracking
 - **HTTP/JSON**: Simple, debuggable inter-service communication
 - **Kubernetes**: Orchestration (local via Tilt, production via K8s)
+- **AccessControlProvider**: External RBAC service (separate deployment)
+- **Credential Registry**: User credential management (to be built)
 
 ---
 
@@ -407,9 +771,10 @@ services:
       - MATRIX_HOMESERVER=${MATRIX_HOMESERVER}
       - MATRIX_USER=${MATRIX_USER}
       - MATRIX_PASSWORD=${MATRIX_PASSWORD}
-      - ADMIN_ROOM_ID=${ADMIN_ROOM_ID}
       - REDIS_URL=redis://redis:6379
       - GRAPH_API_ENDPOINT=http://verji-vagent-graph:8000
+      - ACCESS_CONTROL_PROVIDER_URL=${ACCESS_CONTROL_PROVIDER_URL}
+      - CREDENTIAL_REGISTRY_URL=${CREDENTIAL_REGISTRY_URL}
 
 volumes:
   redis_data:
@@ -507,9 +872,14 @@ async def create_chatbot_graph(session_manager):
 |----------|--------|-----------|
 | **IPC Protocol** | HTTP/JSON + SSE | Simplicity, debuggability, no codegen, streaming support |
 | **Serialization** | JSON | Human-readable, ecosystem alignment, no performance bottleneck |
-| **Session Storage** | Redis | Persistence, pubsub, multi-instance support |
+| **RBAC** | Multi-layer (Bot + Graph + Tools) | Defense in depth, fail fast |
+| **Agent Access** | Bot enforces, silent denial | Protect Graph resources |
+| **Tool Filtering** | Before LLM planning | LLM never sees unavailable tools |
+| **Document Access** | IDs + categories + tags | Scalable, flexible granularity |
+| **Credentials** | Separate Credential Registry | Clean separation of concerns |
+| **Session Storage** | Redis | Persistence, checkpoints, HITL tracking |
 | **Session ID Format** | `room:thread:user` | Unique per conversation context |
-| **HITL Pattern** | Admin room + Redis pubsub | Clean separation, async coordination |
+| **HITL Pattern** | User-in-loop with checkpoint/resume | No blocking, scalable wait times |
 | **State Persistence** | Redis checkpointer | Built-in LangGraph resume capability |
 | **Deployment** | Separate containers | Independence, scaling, monitoring |
 | **Development** | Tilt + K8s | Hot reload, production parity |
@@ -559,10 +929,11 @@ async def create_chatbot_graph(session_manager):
 
 This architecture provides:
 - **Simplicity** with JSON over HTTP for easy debugging and rapid iteration
-- **Scalability** through independent service deployment and horizontal scaling
-- **Reliability** via session persistence and graph checkpoints
-- **Clean HITL** implementation with async human feedback via Redis pubsub
-- **Developer experience** with Tilt hot reload and human-readable logs
+- **Security** with multi-layer RBAC (agent, tool, and document level access control)
+- **Scalability** through independent service deployment, horizontal scaling, and efficient resource patterns
+- **Reliability** via session persistence, graph checkpoints, and checkpoint/resume HITL pattern
+- **User experience** with user-in-the-loop for confirmations and clarifications
+- **Developer experience** with Tilt hot reload, human-readable logs, and no code generation
 - **Flexibility** to add Protobuf later if performance becomes a bottleneck (measure first!)
 
-The system is production-ready and designed for cloud-native deployment while maintaining excellent local development workflows.
+The system is production-ready and designed for cloud-native deployment with comprehensive access control while maintaining excellent local development workflows.

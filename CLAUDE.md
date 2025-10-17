@@ -7,10 +7,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Verji AI Agent is a production-ready Matrix chatbot combining Rust (matrix-rust-sdk) and Python (LangGraph) for intelligent, human-in-the-loop conversational AI.
 
 **Architecture:**
-- **Verji vAgent Bot** (`verji-vagent-bot/`): Matrix client handling message events, session management, and HITL coordination
-- **Verji vAgent Graph** (`verji-vagent-graph/`): LangGraph-based AI workflow orchestration with LLM integration
-- **Redis**: Shared state store for sessions, checkpoints, and pubsub coordination
+- **Verji vAgent Bot** (`verji-vagent-bot/`): Matrix client handling message events, RBAC enforcement, session management, and HITL coordination
+- **Verji vAgent Graph** (`verji-vagent-graph/`): LangGraph-based AI workflow orchestration with LLM integration and fine-grained access control
+- **Redis**: Shared state store for sessions, checkpoints, and HITL tracking
 - **HTTP/JSON**: Simple, debuggable communication between services with Server-Sent Events (SSE) for streaming
+- **AccessControlProvider**: External RBAC service for authentication and authorization
+- **Credential Registry**: User-specific credentials for external tools (to be built)
 
 ## Development Commands
 
@@ -132,21 +134,51 @@ Examples:
 - HITL pending: `hitl_pending:{session_id}`
 - LangGraph checkpoints: Managed by LangGraph's Redis checkpointer
 
+### Role-Based Access Control (RBAC)
+
+Multi-layer RBAC enforces access to agents, tools, and documents:
+
+**Layer 1: Bot (Coarse-Grained)**
+- Validates user has access to agent via AccessControlProvider
+- Gets `AcContext` with user's roles and accessible resource instances
+- Silent denial if user lacks agent access (bot doesn't respond)
+- Passes full `AcContext` to Graph in request body
+
+**Layer 2: Graph (Fine-Grained)**
+- Filters tools BEFORE LLM sees them (LLM only sees allowed tools)
+- Enforces tool invocation access (defense in depth)
+- Filters RAG documents by IDs, categories, and tags
+- Calls Credential Registry for user-specific tool credentials
+
+**Resource Naming:**
+- Agents: `agent:verji_ai_agent`
+- Tools: `tool:database_query`
+- Documents: `document:doc_123`, `document_category:finance`, `document_tag:confidential`
+- Entities (GraphRAG): `entity:customer_456`, `entity_type:customer`
+
+**Key Points:**
+- `AcContext.ActiveRoles` must be used for all access decisions
+- AccessControlProvider handles its own caching (don't cache AcContext in Redis)
+- Domain/tenant derived from Matrix room state event
+- SuperUser bypasses all checks (reflected in roles/permissions)
+
 ### Human-in-the-Loop (HITL) Pattern
 
-The HITL workflow coordinates human approval for sensitive operations:
+HITL asks the **same user** for clarification, confirmation, or additional input during workflow execution:
 
-1. **verji-vagent-graph** (LangGraph) detects risky action → streams `hitl_request` event via SSE
-2. **verji-vagent-bot** receives event, posts question to admin Matrix room
-3. **verji-vagent-bot** subscribes to Redis pubsub channel: `hitl:{session_id}`
-4. **Admin** responds in Matrix room
-5. **verji-vagent-bot** publishes response to Redis channel and POSTs to `/api/v1/submit_feedback`
-6. **verji-vagent-graph** receives feedback, resumes LangGraph from checkpoint
+1. **verji-vagent-graph** reaches HITL node → saves checkpoint → streams `hitl_request` event via SSE → closes stream
+2. **verji-vagent-bot** receives event, stores in Redis (`hitl_pending:{session_id}`)
+3. **verji-vagent-bot** asks **user in same room**: "Confirm delete 1000 records? (yes/no)"
+4. **User** responds: "yes" (seconds or minutes later)
+5. **verji-vagent-bot** detects pending HITL, validates response, POSTs to `/api/v1/submit_feedback`
+6. **verji-vagent-graph** loads checkpoint, resumes workflow, completes action
 
 **Key points:**
-- Admin room ID configured via `ADMIN_ROOM_ID` environment variable
-- Redis pubsub ensures async coordination between services
-- LangGraph uses Redis checkpointer to persist state and resume after HITL
+- HITL asks the **user**, not a third-party admin
+- Graph checkpoints and exits (doesn't block waiting for response)
+- Bot checks Redis on every message to detect HITL responses
+- Timeout: default 1 hour (configurable per request)
+- After timeout, user's next message treated as new query
 
 ### State Persistence
 - **Session state**: Redis with 24-hour TTL
@@ -170,7 +202,8 @@ Expected modules (refer to [ARCHITECTURE.md](./ARCHITECTURE.md) for detailed exa
 - `main.rs`: Entry point, Matrix client setup, event loop
 - `types.rs`: Shared JSON message types (serde)
 - `session.rs`: Session management, Redis operations
-- `hitl.rs`: HITL coordination, admin room integration
+- `rbac.rs`: AccessControlProvider integration, AcContext handling
+- `hitl.rs`: HITL coordination, user response detection
 - `http_client.rs`: HTTP/SSE client to verji-vagent-graph service
 
 ### Verji vAgent Graph Architecture (verji-vagent-graph/)
@@ -179,15 +212,19 @@ Expected modules:
 - `types.py`: Shared JSON message types (Pydantic/dataclasses)
 - `api.py`: FastAPI route handlers with SSE streaming
 - `session_manager.py`: Redis session operations
+- `rbac.py`: RBAC enforcement, tool filtering, document filtering
+- `credential_registry.py`: Client for Credential Registry service
 - `langgraph_workflow.py`: LangGraph workflow definitions with HITL nodes
 
 ### LangGraph Workflow Pattern
 LangGraph workflows should:
-- Use `State` TypedDict with `session_id`, `messages`, `proposed_action`, `approval`, `final_response`
-- Implement conditional edges to route to HITL approval node for risky actions
+- Use `State` TypedDict with `session_id`, `ac_context`, `messages`, `available_tools`, `proposed_action`, `hitl_response`
+- First node: Parse `AcContext` from request, filter available tools
+- Planning node: Use filtered `available_tools` list (LLM only sees allowed tools)
+- Tool invocation: Check access, get credentials from Credential Registry if needed
+- HITL node: Send `hitl_request` event, checkpoint, and exit (don't wait)
+- RAG node: Filter documents based on `AcContext` (IDs, categories, tags)
 - Use Redis checkpointer: `RedisSaver(session_manager.redis)`
-- Stream `hitl_request` SSE event when human approval needed
-- Wait for feedback via Redis pubsub before resuming
 
 ## Environment Configuration
 
@@ -197,9 +234,10 @@ Copy `.env.example` to `.env` and configure:
 - `MATRIX_HOMESERVER`: Matrix server URL
 - `MATRIX_USER`: Bot username (e.g., `@bot:matrix.org`)
 - `MATRIX_PASSWORD`: Bot password
-- `ADMIN_ROOM_ID`: Matrix room for HITL approvals (e.g., `!adminroom:matrix.org`)
 - `REDIS_URL`: Redis connection string
 - `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`: LLM API keys
+- `ACCESS_CONTROL_PROVIDER_URL`: AccessControlProvider service endpoint
+- `CREDENTIAL_REGISTRY_URL`: Credential Registry service endpoint (when available)
 
 **Optional:**
 - `GRAPH_API_ENDPOINT`: verji-vagent-graph service endpoint (default: `http://verji-vagent-graph:8000`)
@@ -240,7 +278,8 @@ Benefits:
 ### Redis Usage
 1. **Session storage**: Persist session state with TTL
 2. **LangGraph checkpoints**: Enable graph resumption after HITL
-3. **Pubsub**: Coordinate HITL feedback between services (channel: `hitl:{session_id}`)
+3. **HITL tracking**: Store pending HITL requests (`hitl_pending:{session_id}`)
+4. **NOT used for**: AcContext caching (AccessControlProvider handles caching)
 
 ### Matrix Integration
 - Uses `matrix-rust-sdk` 0.7
@@ -281,10 +320,13 @@ tilt up  # Start services
 - **Tiltfile is the source of truth**: For local development configuration, refer to the Tiltfile
 - **Never spawn/fork services**: Each service runs independently in its own container
 - **HTTP/JSON not gRPC**: Services communicate via HTTP/JSON + SSE for simplicity and debuggability
+- **RBAC is multi-layer**: Bot enforces agent access, Graph enforces tool/document access
+- **Tool filtering**: Graph filters tools BEFORE LLM sees them (security + UX)
+- **AcContext NOT cached in Redis**: AccessControlProvider handles caching
 - **Session ID format**: Always use hierarchical format `room:thread:user`
+- **HITL asks user, not admin**: User responds in same room/thread
 - **HITL timeout**: Default 1 hour (3600 seconds), configurable per request
 - **Redis TTL**: Sessions expire after 24 hours of inactivity
-- **Admin room security**: Only process HITL responses from configured `ADMIN_ROOM_ID`
 - **Dockerfile.dev files**: Used by Tilt for hot reload - don't modify regular Dockerfiles for dev
 - **API documentation**: Access FastAPI Swagger docs at `http://localhost:8000/docs` when running
 
@@ -381,8 +423,10 @@ tilt up
 
 ## Contributing Guidelines
 
-1. **Architecture decisions**: Refer to [ARCHITECTURE.md](./ARCHITECTURE.md) for rationale behind HTTP/JSON, Redis, session management
+1. **Architecture decisions**: Refer to [ARCHITECTURE.md](./ARCHITECTURE.md) for rationale behind HTTP/JSON, RBAC, HITL, session management
 2. **API changes**: Update types in `verji-vagent-bot/src/types.rs` and `verji-vagent-graph/src/types.py` to keep schemas in sync
-3. **Error handling**: Always handle Redis connection failures, HTTP timeouts, Matrix API errors
-4. **Logging**: Use structured logging (Rust: `tracing`, Python: built-in `logging`)
-5. **Type safety**: Use serde for Rust, Pydantic for Python to enforce JSON schemas
+3. **RBAC enforcement**: Bot checks agent access, Graph filters tools and documents
+4. **Error handling**: Always handle Redis connection failures, HTTP timeouts, Matrix API errors, AccessControlProvider unavailability
+5. **Logging**: Use structured logging (Rust: `tracing`, Python: built-in `logging`)
+6. **Audit logging**: Log all access decisions (agent, tool, document access) with user_id and resource
+7. **Type safety**: Use serde for Rust, Pydantic for Python to enforce JSON schemas
