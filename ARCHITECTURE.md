@@ -35,11 +35,38 @@ graph TD
 
 ---
 
-## 1. Service Communication (HTTP/JSON)
+## 1. Service Communication
 
-### Why JSON Over Protobuf
+### Current Implementation: Redis Pubsub (Echo POC)
 
-**Design Decision:** Use JSON over HTTP for inter-service communication instead of gRPC/Protobuf.
+**Current State:** The echo POC uses Redis pubsub for bot↔graph communication with streaming progress notifications.
+
+**How it works:**
+1. Bot subscribes to `vagent:responses` channel **before** publishing request (prevents race condition)
+2. Bot publishes request to `vagent:requests` channel with JSON message
+3. Graph processes request and publishes progress messages to `vagent:responses` channel
+4. Bot receives streaming progress messages and sends each to Matrix room
+5. Graph publishes final response when complete
+
+**Message Types:**
+- `progress`: Intermediate progress updates (e.g., "🔍 Analyzing your question...")
+- `final_response`: Final answer from the agent
+- `hitl_request`: Human-in-the-loop request (workflow paused, needs user input)
+- `error`: Error during processing
+
+**Benefits of Redis Pubsub for POC:**
+- Simple to implement and debug
+- Built-in pubsub with Redis already required for sessions/checkpoints
+- Natural fit for streaming notifications
+- No additional HTTP server setup needed
+
+**Migration Path:** When moving beyond POC, migrate to HTTP/JSON + SSE (see below).
+
+---
+
+### Future: HTTP/JSON with Server-Sent Events
+
+**Design Decision:** Migrate to JSON over HTTP with SSE for inter-service communication (instead of gRPC/Protobuf).
 
 **Rationale:**
 - **No performance bottleneck**: LLM API calls (seconds) and HITL workflows (minutes) dominate latency
@@ -117,6 +144,68 @@ Health check endpoint.
   "uptime_seconds": 86400
 }
 ```
+
+### Redis Pubsub Implementation (Current POC)
+
+**Rust Bot (redis_client.rs):**
+```rust
+// Subscribe BEFORE publishing to avoid race condition
+let mut pubsub = client.get_async_pubsub().await?;
+pubsub.subscribe("vagent:responses").await?;
+
+// Publish request
+let request = GraphRequest { request_id, query, metadata };
+connection.publish("vagent:requests", serde_json::to_string(&request)?).await?;
+
+// Listen for streaming responses
+async for message in pubsub.on_message() {
+    let graph_msg: GraphMessage = serde_json::from_str(&message.get_payload()?)?;
+
+    match graph_msg.message_type {
+        GraphMessageType::Progress => {
+            // Send progress to Matrix room via tokio channel
+            progress_tx.send(graph_msg.content)?;
+            continue; // Keep waiting for final response
+        }
+        GraphMessageType::FinalResponse => {
+            return Ok(graph_msg.content);
+        }
+        // ... handle other types
+    }
+}
+```
+
+**Python Graph (main.py):**
+```python
+async def emit_progress(self, request_id: str, content: str):
+    """Stream progress notification"""
+    message = {
+        "request_id": request_id,
+        "message_type": "progress",
+        "content": content
+    }
+    await self.redis_client.publish("vagent:responses", json.dumps(message))
+
+async def process_query(self, request_id: str, query: str):
+    # Emit progress updates
+    await self.emit_progress(request_id, "🔍 Analyzing your question...")
+    await asyncio.sleep(0.5)
+
+    await self.emit_progress(request_id, "🧠 Thinking about the best response...")
+    await asyncio.sleep(0.5)
+
+    # Process and emit final response
+    response = f"[Echo POC] You said: {query}"
+    await self.emit_final_response(request_id, response)
+```
+
+**Key Implementation Details:**
+- Bot uses tokio mpsc channel to bridge sync callback → async Matrix sends
+- Background task spawned to send each progress message to Matrix room
+- Race condition fixed: subscribe before publish (prevents missing fast messages)
+- Each progress update appears as separate message in Matrix room
+
+---
 
 ### Message Schema Definitions
 
