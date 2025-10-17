@@ -13,6 +13,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 mod client;
 mod encryption;
+mod redis_client;
 mod responder;
 mod responder_manager;
 mod responders;
