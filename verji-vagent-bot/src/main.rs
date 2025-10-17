@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use clap::Parser;
 use matrix_sdk::{
     config::SyncSettings,
     encryption::EncryptionSettings,
@@ -8,6 +9,15 @@ use matrix_sdk::{
 use std::path::PathBuf;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
+#[derive(Parser, Debug)]
+#[command(name = "verji-vagent-bot")]
+#[command(about = "Verji vAgent Bot - Matrix bot with E2EE support", long_about = None)]
+struct Args {
+    /// Clear the store directory before starting (useful for device ID mismatches)
+    #[arg(long)]
+    clear_store: bool,
+}
 
 /// Setup encryption keys (cross-signing and backups)
 async fn setup_encryption(client: &Client, store_path: &PathBuf) -> Result<()> {
@@ -106,6 +116,9 @@ async fn setup_encryption(client: &Client, store_path: &PathBuf) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Parse command-line arguments
+    let args = Args::parse();
+
     // Initialize logging
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
@@ -140,6 +153,15 @@ async fn main() -> Result<()> {
 
     // Create store path if it doesn't exist
     let store_path_buf = PathBuf::from(&store_path);
+
+    // Clear store if requested
+    if args.clear_store && store_path_buf.exists() {
+        info!("🗑️  Clearing store directory as requested: {}", store_path);
+        std::fs::remove_dir_all(&store_path_buf)
+            .context("Failed to remove store directory")?;
+        info!("✅ Store directory cleared");
+    }
+
     if !store_path_buf.exists() {
         info!("Creating store directory: {}", store_path);
         std::fs::create_dir_all(&store_path_buf)
@@ -164,32 +186,63 @@ async fn main() -> Result<()> {
     debug!("Matrix client created successfully");
 
     // Check if we have a valid session already
-    let needs_login = client.user_id().is_none();
-
-    if !needs_login {
-        info!("✓ Restored session from store");
-        let user_id = client.user_id().context("User ID not found")?;
-        if let Some(device_id) = client.device_id() {
+    let session_source = if client.user_id().is_some() {
+        info!("🔄 Found existing session in store");
+        if let Some(user_id) = client.user_id() {
             info!("  User ID: {}", user_id);
+        }
+        if let Some(device_id) = client.device_id() {
             info!("  Device ID: {}", device_id);
         }
+        info!("  Session source: Restored from persistent storage");
+        "restored"
     } else {
-        // Login with credentials
-        info!("🔐 Logging in as: {}", username);
-        client
+        // No session found, need to login
+        info!("🔐 No existing session found, logging in as: {}", username);
+
+        match client
             .matrix_auth()
             .login_username(&username, &password)
             .initial_device_display_name("Verji vAgent Bot")
             .await
-            .context("Failed to login")?;
-
-        info!("✓ Successfully logged in");
-        let user_id = client.user_id().context("User ID not found")?;
-        if let Some(device_id) = client.device_id() {
-            info!("  User ID: {}", user_id);
-            info!("  Device ID: {}", device_id);
-            info!("  Session persisted to: {}", store_path);
+        {
+            Ok(_) => {
+                info!("✅ Successfully logged in");
+                if let Some(user_id) = client.user_id() {
+                    info!("  User ID: {}", user_id);
+                }
+                if let Some(device_id) = client.device_id() {
+                    info!("  Device ID: {}", device_id);
+                }
+                info!("  Session persisted to: {}", store_path);
+                info!("  Session source: New login");
+                "new_login"
+            }
+            Err(e) => {
+                // Check if this is a device mismatch error
+                let error_msg = e.to_string();
+                if error_msg.contains("doesn't match the account in the constructor")
+                    || error_msg.contains("account in the store doesn't match") {
+                    error!("❌ Device ID mismatch detected in crypto store");
+                    error!("   This usually happens when the store contains a different device");
+                    error!("   Suggested fix: Run with --clear-store flag or delete the store directory");
+                    error!("   Store path: {}", store_path);
+                    error!("   Command: cargo run -- --clear-store");
+                    return Err(e).context("Crypto store device mismatch - run with --clear-store flag");
+                } else {
+                    return Err(e).context("Failed to login");
+                }
+            }
         }
+    };
+
+    info!("📊 Session Status Summary:");
+    info!("  Source: {}", session_source);
+    if let Some(user_id) = client.user_id() {
+        info!("  Active User: {}", user_id);
+    }
+    if let Some(device_id) = client.device_id() {
+        info!("  Active Device: {}", device_id);
     }
 
     // Setup encryption (cross-signing and backups)

@@ -34,10 +34,27 @@ This is a minimal proof-of-concept that:
 ## Running
 
 ```bash
-# Development mode with logging
-RUST_LOG=verji_vagent_bot=info cargo run
+# Standard run
+cargo run
 
-# Or just
+# With verbose logging
+RUST_LOG=verji_vagent_bot=debug cargo run
+
+# Clear store and start fresh (useful for device ID mismatch errors)
+cargo run -- --clear-store
+```
+
+### Troubleshooting
+
+**Device ID Mismatch Error:**
+If you see an error like `"account in the store doesn't match"`, this means the crypto store has data from a different device. Fix it by:
+
+```bash
+# Option 1: Use the --clear-store flag
+cargo run -- --clear-store
+
+# Option 2: Manually delete the store directory
+rm -rf ./matrix_store  # or your custom MATRIX_STORE_PATH
 cargo run
 ```
 
