@@ -15,23 +15,20 @@ Verji AI Agent is a production-ready Matrix chatbot that combines:
 
 ```mermaid
 graph TD
-    A[Matrix Server<br/>Matrix /sync API] -->|Matrix Client-Server Protocol| B
+    A([Matrix Server<br/>Matrix /sync API])
+    B([Verji vAgent Bot Service<br/>matrix-rust-sdk<br/>━━━━━━━━━━━━━━━━━<br/>• Matrix event handling<br/>• Session ID management<br/>• HITL coordination<br/>• Message routing])
+    C([Verji vAgent Graph<br/>LangGraph Service<br/>━━━━━━━━━━━━━━━━━<br/>• LangGraph workflow execution<br/>• LLM orchestration<br/>• HITL node handling<br/>• State persistence])
+    D[(Redis<br/>━━━━━━━━━━━━━━━━━<br/>• Session state storage<br/>• LangGraph checkpoints<br/>• HITL pubsub channels<br/>• Message history/context)]
 
-    B[Verji vAgent Bot Service<br/>matrix-rust-sdk<br/>━━━━━━━━━━━━━━━━━<br/>• Matrix event handling<br/>• Session ID management<br/>• HITL coordination<br/>• Message routing]
-
+    A -->|Matrix Client-Server Protocol| B
     B -->|gRPC bidirectional streaming| C
+    C -.->|Redis connection| D
+    B -.->|Redis connection| D
 
-    C[Verji vAgent Graph<br/>LangGraph Service<br/>━━━━━━━━━━━━━━━━━<br/>• LangGraph workflow execution<br/>• LLM orchestration<br/>• HITL node handling<br/>• State persistence]
-
-    C -->|Redis connection| D
-    B -->|Redis connection| D
-
-    D[Redis<br/>━━━━━━━━━━━━━━━━━<br/>• Session state storage<br/>• LangGraph checkpoints<br/>• HITL pubsub channels<br/>• Message history/context]
-
-    style A fill:#e1f5ff
-    style B fill:#fff4e1
-    style C fill:#e8f5e9
-    style D fill:#fce4ec
+    style A fill:#e1f5ff,stroke:#0288d1,stroke-width:3px,color:#000
+    style B fill:#fff4e1,stroke:#f57c00,stroke-width:3px,color:#000
+    style C fill:#e8f5e9,stroke:#388e3c,stroke-width:3px,color:#000
+    style D fill:#fce4ec,stroke:#c2185b,stroke-width:3px,color:#000
 ```
 
 ---
@@ -157,26 +154,27 @@ impl SessionId {
 
 ```mermaid
 sequenceDiagram
-    participant User as Matrix Room (User)
-    participant Bot as Verji vAgent Bot
-    participant Graph as Verji vAgent Graph
-    participant Admin as Matrix Admin Room
-    participant Redis as Redis Pubsub
+    autonumber
+    participant User as 👤 Matrix Room (User)
+    participant Bot as 🤖 Verji vAgent Bot
+    participant Graph as 🧠 Verji vAgent Graph
+    participant Admin as 👨‍💼 Matrix Admin Room
+    participant Redis as 💾 Redis Pubsub
 
-    User->>Bot: "Help me with X"
-    Note over Bot: 1. Receive message event<br/>2. Extract session_id
-    Bot->>Graph: gRPC: ProcessMessage
-    Note over Graph: 1. Load graph state from Redis<br/>2. Execute LangGraph nodes<br/>3. Reach HITL node → pause graph
-    Graph->>Bot: gRPC: HITLRequest
-    Note over Bot: 1. Receive HITLRequest<br/>2. Post question to admin room<br/>3. Subscribe to Redis pubsub
-    Bot->>Admin: "❓ Approval needed: Delete records?"
-    Admin->>Bot: "no - too risky"
+    User->>+Bot: "Help me with X"
+    Note over Bot: Receive message event<br/>Extract session_id
+    Bot->>+Graph: gRPC: ProcessMessage
+    Note over Graph: Load graph state from Redis<br/>Execute LangGraph nodes<br/>Reach HITL node → pause graph
+    Graph-->>-Bot: gRPC: HITLRequest
+    Note over Bot: Receive HITLRequest<br/>Post question to admin room<br/>Subscribe to Redis pubsub
+    Bot->>+Admin: ❓ Approval needed: Delete records?
+    Admin-->>-Bot: ❌ no - too risky
     Note over Bot: Parse admin response
     Bot->>Redis: Publish feedback to hitl:{session_id}
-    Bot->>Graph: gRPC: SubmitHumanFeedback
-    Note over Graph: 1. Receive feedback<br/>2. Resume from checkpoint<br/>3. Update state<br/>4. Complete workflow
-    Graph->>Bot: gRPC: Final response
-    Bot->>User: Send final reply
+    Bot->>+Graph: gRPC: SubmitHumanFeedback
+    Note over Graph: Receive feedback<br/>Resume from checkpoint<br/>Update state<br/>Complete workflow
+    Graph-->>-Bot: gRPC: Final response
+    Bot-->>-User: ✅ Send final reply
 ```
 
 ### Key HITL Implementation Details
@@ -196,21 +194,20 @@ sequenceDiagram
 
 ```mermaid
 graph TB
-    subgraph k8s["Docker Host / Kubernetes"]
-        bot[verji-vagent-bot<br/>━━━━━━━━━━━━━━━<br/>• Matrix client<br/>• gRPC client<br/>• HITL coordinator]
-
-        graph[verji-vagent-graph<br/>━━━━━━━━━━━━━━━<br/>• gRPC server<br/>• LangGraph execution<br/>• LLM integration]
-
-        redis[Redis<br/>━━━━━━━━━━━━━━━<br/>• Session store<br/>• Checkpoints<br/>• Pubsub]
+    subgraph k8s["🐳 Docker Host / Kubernetes"]
+        bot([verji-vagent-bot<br/>━━━━━━━━━━━━━━━<br/>• Matrix client<br/>• gRPC client<br/>• HITL coordinator])
+        graph([verji-vagent-graph<br/>━━━━━━━━━━━━━━━<br/>• gRPC server<br/>• LangGraph execution<br/>• LLM integration])
+        redis[(Redis<br/>━━━━━━━━━━━━━━━<br/>• Session store<br/>• Checkpoints<br/>• Pubsub)]
 
         bot <-->|gRPC| graph
-        bot <-->|Redis protocol| redis
-        graph <-->|Redis protocol| redis
+        bot -.->|Redis protocol| redis
+        graph -.->|Redis protocol| redis
     end
 
-    style bot fill:#fff4e1
-    style graph fill:#e8f5e9
-    style redis fill:#fce4ec
+    style k8s fill:#f5f5f5,stroke:#666,stroke-width:2px,stroke-dasharray: 5 5
+    style bot fill:#fff4e1,stroke:#f57c00,stroke-width:3px,color:#000
+    style graph fill:#e8f5e9,stroke:#388e3c,stroke-width:3px,color:#000
+    style redis fill:#fce4ec,stroke:#c2185b,stroke-width:3px,color:#000
 ```
 
 ### Startup Order
