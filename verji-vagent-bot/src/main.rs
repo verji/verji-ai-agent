@@ -9,6 +9,101 @@ use std::path::PathBuf;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
+/// Setup encryption keys (cross-signing and backups)
+async fn setup_encryption(client: &Client, store_path: &PathBuf) -> Result<()> {
+    let encryption = client.encryption();
+
+    info!("🔐 Setting up encryption...");
+
+    // Check cross-signing status
+    let cross_signing_status = encryption.cross_signing_status().await;
+
+    match cross_signing_status {
+        Some(status) => {
+            info!("  Cross-signing status: {:?}", status);
+
+            // If cross-signing is not set up, bootstrap it
+            if !status.has_master || !status.has_self_signing || !status.has_user_signing {
+                info!("  Cross-signing keys missing, bootstrapping...");
+
+                match encryption.bootstrap_cross_signing(None).await {
+                    Ok(_) => {
+                        info!("  ✅ Cross-signing bootstrapped successfully");
+                    }
+                    Err(e) => {
+                        warn!("  ⚠️  Failed to bootstrap cross-signing: {}", e);
+                        info!("     This is non-fatal, encryption will still work");
+                    }
+                }
+            } else {
+                info!("  ✅ Cross-signing already set up");
+            }
+        }
+        None => {
+            info!("  Cross-signing not available");
+        }
+    }
+
+    // Setup key backups and recovery
+    info!("  Setting up key backups and recovery...");
+
+    // Check if recovery is enabled
+    let recovery = encryption.recovery();
+    let state = recovery.state();
+    info!("  Recovery state: {:?}", state);
+
+    if state == matrix_sdk::encryption::recovery::RecoveryState::Disabled {
+        info!("  Enabling recovery and backups...");
+
+        // Enable recovery with automatic backup
+        match recovery.enable().await {
+            Ok(recovery_key) => {
+                info!("  ✅ Recovery and backups enabled successfully");
+
+                // Save recovery key to file
+                let recovery_key_path = store_path.join("recovery_key.txt");
+                match std::fs::write(&recovery_key_path, &recovery_key) {
+                    Ok(_) => {
+                        info!("  ✅ Recovery key saved to: {:?}", recovery_key_path);
+                        info!("  🔑 Recovery key: {}", recovery_key);
+                        info!("     ⚠️  IMPORTANT: Save this recovery key securely!");
+                    }
+                    Err(e) => {
+                        warn!("  ⚠️  Failed to save recovery key to file: {}", e);
+                        info!("  🔑 Recovery key: {}", recovery_key);
+                        info!("     ⚠️  IMPORTANT: Save this recovery key securely!");
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("  ⚠️  Failed to enable recovery: {}", e);
+                info!("     This is non-fatal, encryption will still work");
+            }
+        }
+    } else {
+        info!("  ✅ Recovery already enabled");
+    }
+
+    // Log backup status
+    match encryption.backups().state() {
+        matrix_sdk::encryption::backups::BackupState::Enabled => {
+            info!("  ✅ Backups are enabled");
+        }
+        state => {
+            info!("  Backup state: {:?}", state);
+        }
+    }
+
+    // Log final encryption status
+    info!("🔐 Encryption setup complete:");
+    if let Some(status) = encryption.cross_signing_status().await {
+        info!("  Cross-signing: master={}, self={}, user={}",
+            status.has_master, status.has_self_signing, status.has_user_signing);
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logging
@@ -97,15 +192,8 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Check encryption status
-    let encryption = client.encryption();
-    info!("🔐 Encryption status:");
-    if let Some(status) = encryption.cross_signing_status().await {
-        info!("  Cross-signing status: {:?}", status);
-    } else {
-        info!("  Cross-signing: not available");
-    }
-    info!("  Backups enabled: auto (when keys available)");
+    // Setup encryption (cross-signing and backups)
+    setup_encryption(&client, &store_path_buf).await?;
 
     // Register event handler for room messages
     client.add_event_handler(
