@@ -3,7 +3,23 @@
     "allow": [
       "Bash(dir:*)",
       "Bash(git reset:*)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(dos2unix:*)",
+      "Bash(cargo init:*)",
+      "Bash(cargo check:*)",
+      "Bash(cargo build:*)",
+      "Bash(cargo clean:*)",
+      "Bash(cargo search:*)",
+      "Bash(cargo update:*)",
+      "Bash(cargo info:*)",
+      "Bash(cargo doc:*)",
+      "Bash(cat:*)",
+      "Read(//c/dev/src/rbot-ai-experiment/v-agent/src/**)",
+      "Read(//c/dev/src/rbot-ai-experiment/v-agent/**)",
+      "Bash(git restore:*)",
+      "Bash(in the constructor\" with clear user guidance.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Claude <noreply@anthropic.com>\nEOF\n)\")"
     ],
     "deny": [],
     "ask": []

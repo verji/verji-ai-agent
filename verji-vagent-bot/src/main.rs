@@ -17,13 +17,25 @@ struct Args {
     /// Clear the store directory before starting (useful for device ID mismatches)
     #[arg(long)]
     clear_store: bool,
+
+    /// Reset all encryption (delete backups, cross-signing, and create fresh keys)
+    #[arg(long)]
+    reset_encryption: bool,
 }
 
 /// Setup encryption keys (cross-signing and backups)
-async fn setup_encryption(client: &Client, store_path: &PathBuf) -> Result<()> {
+async fn setup_encryption(client: &Client, store_path: &PathBuf, reset: bool) -> Result<()> {
     let encryption = client.encryption();
 
     info!("🔐 Setting up encryption...");
+
+    // If reset is requested, we'll force new keys
+    if reset {
+        info!("🔄 Reset encryption requested - will create fresh keys...");
+        info!("  Note: This will override any existing keys on the server");
+        info!("  Existing backup on server will remain but won't be used");
+        info!("  Will force bootstrap new cross-signing keys and create new recovery key");
+    }
 
     // Check cross-signing status
     let cross_signing_status = encryption.cross_signing_status().await;
@@ -32,9 +44,13 @@ async fn setup_encryption(client: &Client, store_path: &PathBuf) -> Result<()> {
         Some(status) => {
             info!("  Cross-signing status: {:?}", status);
 
-            // If cross-signing is not set up, bootstrap it
-            if !status.has_master || !status.has_self_signing || !status.has_user_signing {
-                info!("  Cross-signing keys missing, bootstrapping...");
+            // If cross-signing is not set up OR reset is requested, bootstrap it
+            if reset || !status.has_master || !status.has_self_signing || !status.has_user_signing {
+                if reset {
+                    info!("  Forcing cross-signing bootstrap (reset mode)...");
+                } else {
+                    info!("  Cross-signing keys missing, bootstrapping...");
+                }
 
                 match encryption.bootstrap_cross_signing(None).await {
                     Ok(_) => {
@@ -62,63 +78,96 @@ async fn setup_encryption(client: &Client, store_path: &PathBuf) -> Result<()> {
     let state = recovery.state();
     info!("  Recovery state: {:?}", state);
 
-    if state == matrix_sdk::encryption::recovery::RecoveryState::Disabled {
-        info!("  Checking for existing backup on server...");
+    // If reset mode or recovery is disabled, try to enable it
+    if reset || state == matrix_sdk::encryption::recovery::RecoveryState::Disabled {
+        if reset {
+            info!("  Creating new recovery and backup (reset mode)...");
+        } else {
+            info!("  Checking for existing backup on server...");
+        }
 
-        // Check if a backup exists on the server
-        match encryption.backups().exists_on_server().await {
-            Ok(true) => {
-                info!("  📦 Backup already exists on server");
-                info!("  Note: Cannot create new recovery key when backup exists");
-                info!("  This is normal if the account was used before");
+        // In reset mode, we already deleted the backup above, so just create new one
+        if reset {
+            info!("  Creating fresh backup with new recovery key...");
 
-                // Try to fetch and enable the existing backup if we have the recovery key
-                // For now, just log that backups exist
-                info!("  ⚠️  To use existing backup, you need the recovery key from previous setup");
-            }
-            Ok(false) => {
-                info!("  No existing backup found, creating new one...");
+            match recovery.enable().await {
+                Ok(recovery_key) => {
+                    info!("  ✅ Recovery and backups enabled successfully");
 
-                // Enable recovery with automatic backup
-                match recovery.enable().await {
-                    Ok(recovery_key) => {
-                        info!("  ✅ Recovery and backups enabled successfully");
-
-                        // Save recovery key to file
-                        let recovery_key_path = store_path.join("recovery_key.txt");
-                        match std::fs::write(&recovery_key_path, &recovery_key) {
-                            Ok(_) => {
-                                info!("  ✅ Recovery key saved to: {:?}", recovery_key_path);
-                                info!("  🔑 Recovery key: {}", recovery_key);
-                                info!("     ⚠️  IMPORTANT: Save this recovery key securely!");
-                            }
-                            Err(e) => {
-                                warn!("  ⚠️  Failed to save recovery key to file: {}", e);
-                                info!("  🔑 Recovery key: {}", recovery_key);
-                                info!("     ⚠️  IMPORTANT: Save this recovery key securely!");
-                            }
+                    // Save recovery key to file
+                    let recovery_key_path = store_path.join("recovery_key.txt");
+                    match std::fs::write(&recovery_key_path, &recovery_key) {
+                        Ok(_) => {
+                            info!("  ✅ Recovery key saved to: {:?}", recovery_key_path);
+                            info!("  🔑 Recovery key: {}", recovery_key);
+                            info!("     ⚠️  IMPORTANT: Save this recovery key securely!");
+                        }
+                        Err(e) => {
+                            warn!("  ⚠️  Failed to save recovery key to file: {}", e);
+                            info!("  🔑 Recovery key: {}", recovery_key);
+                            info!("     ⚠️  IMPORTANT: Save this recovery key securely!");
                         }
                     }
-                    Err(e) => {
-                        warn!("  ⚠️  Failed to enable recovery: {}", e);
-                        info!("     This is non-fatal, encryption will still work");
-                    }
+                }
+                Err(e) => {
+                    warn!("  ⚠️  Failed to enable recovery: {}", e);
+                    info!("     This is non-fatal, encryption will still work");
                 }
             }
-            Err(e) => {
-                warn!("  ⚠️  Failed to check backup status: {}", e);
-                info!("     Will try to enable recovery anyway...");
+        } else {
+            // Normal mode - check if backup exists
+            match encryption.backups().exists_on_server().await {
+                Ok(true) => {
+                    info!("  📦 Backup already exists on server");
+                    info!("  Note: Cannot create new recovery key when backup exists");
+                    info!("  This is normal if the account was used before");
+                    info!("  ⚠️  To use existing backup, you need the recovery key from previous setup");
+                    info!("  💡 Tip: Use --reset-encryption to delete old backup and create fresh keys");
+                }
+                Ok(false) => {
+                    info!("  No existing backup found, creating new one...");
 
-                // Try to enable anyway
-                match recovery.enable().await {
-                    Ok(recovery_key) => {
-                        info!("  ✅ Recovery enabled");
-                        let recovery_key_path = store_path.join("recovery_key.txt");
-                        let _ = std::fs::write(&recovery_key_path, &recovery_key);
-                        info!("  🔑 Recovery key: {}", recovery_key);
+                    // Enable recovery with automatic backup
+                    match recovery.enable().await {
+                        Ok(recovery_key) => {
+                            info!("  ✅ Recovery and backups enabled successfully");
+
+                            // Save recovery key to file
+                            let recovery_key_path = store_path.join("recovery_key.txt");
+                            match std::fs::write(&recovery_key_path, &recovery_key) {
+                                Ok(_) => {
+                                    info!("  ✅ Recovery key saved to: {:?}", recovery_key_path);
+                                    info!("  🔑 Recovery key: {}", recovery_key);
+                                    info!("     ⚠️  IMPORTANT: Save this recovery key securely!");
+                                }
+                                Err(e) => {
+                                    warn!("  ⚠️  Failed to save recovery key to file: {}", e);
+                                    info!("  🔑 Recovery key: {}", recovery_key);
+                                    info!("     ⚠️  IMPORTANT: Save this recovery key securely!");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("  ⚠️  Failed to enable recovery: {}", e);
+                            info!("     This is non-fatal, encryption will still work");
+                        }
                     }
-                    Err(e2) => {
-                        warn!("  ⚠️  Could not enable recovery: {}", e2);
+                }
+                Err(e) => {
+                    warn!("  ⚠️  Failed to check backup status: {}", e);
+                    info!("     Will try to enable recovery anyway...");
+
+                    // Try to enable anyway
+                    match recovery.enable().await {
+                        Ok(recovery_key) => {
+                            info!("  ✅ Recovery enabled");
+                            let recovery_key_path = store_path.join("recovery_key.txt");
+                            let _ = std::fs::write(&recovery_key_path, &recovery_key);
+                            info!("  🔑 Recovery key: {}", recovery_key);
+                        }
+                        Err(e2) => {
+                            warn!("  ⚠️  Could not enable recovery: {}", e2);
+                        }
                     }
                 }
             }
@@ -302,7 +351,7 @@ async fn main() -> Result<()> {
     }
 
     // Setup encryption (cross-signing and backups)
-    setup_encryption(&client, &store_path_buf).await?;
+    setup_encryption(&client, &store_path_buf, args.reset_encryption).await?;
 
     // Register event handler for room messages
     client.add_event_handler(
