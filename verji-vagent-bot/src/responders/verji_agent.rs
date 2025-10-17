@@ -82,23 +82,43 @@ impl Responder for VerjiAgentResponder {
         let mut client_guard = self.redis_client.lock().await;
         let client = client_guard.as_mut().expect("Redis client should be initialized");
 
-        // Define progress callback
-        // TODO: In the future, send these as typing indicators or message edits to Matrix
-        let on_progress = |progress_msg: String| {
-            info!("📊 Progress update: {}", progress_msg);
-            // Future: context.room.typing_notice(true).await
-            // Future: Or send/edit a message in the room
+        // Create a channel for progress messages
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        // Spawn a task to send progress messages to Matrix
+        let room_clone = context.room.clone();
+        let progress_task = tokio::spawn(async move {
+            while let Some(progress_msg) = progress_rx.recv().await {
+                info!("📊 Sending progress to Matrix: {}", progress_msg);
+
+                use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
+                let content = RoomMessageEventContent::text_plain(&progress_msg);
+
+                if let Err(e) = room_clone.send(content).await {
+                    warn!("Failed to send progress message to Matrix: {}", e);
+                }
+            }
+        });
+
+        // Define progress callback that sends to the channel
+        let on_progress = move |progress_msg: String| {
+            let _ = progress_tx.send(progress_msg);
         };
 
-        match client
+        let result = client
             .query_with_streaming(
                 context.message_body.clone(),
                 context.room.room_id().to_string(),
                 context.sender.clone(),
                 on_progress,
             )
-            .await
-        {
+            .await;
+
+        // Wait for progress task to finish sending all messages
+        drop(client_guard); // Release lock before waiting
+        progress_task.await.ok();
+
+        match result {
             Ok(response) => {
                 info!("✅ Received final response from vagent-graph");
                 Ok(ResponderResult::Handled(Some(response)))

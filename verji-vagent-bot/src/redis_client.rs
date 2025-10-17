@@ -135,7 +135,15 @@ impl RedisGraphClient {
 
         debug!("Sending request {} to vagent-graph", request_id);
 
-        // Serialize and publish request
+        // IMPORTANT: Subscribe BEFORE publishing to avoid race condition
+        // Create pubsub connection and subscribe to response channel first
+        let client = Client::open(self.redis_url.as_str())
+            .context("Failed to create Redis client for pubsub")?;
+        let mut pubsub = client.get_async_pubsub().await?;
+        pubsub.subscribe(&self.response_channel).await?;
+        debug!("Subscribed to response channel before publishing request");
+
+        // Now serialize and publish request
         let request_json = serde_json::to_string(&request).context("Failed to serialize request")?;
 
         self.connection
@@ -145,9 +153,9 @@ impl RedisGraphClient {
 
         debug!("Request {} published, waiting for response...", request_id);
 
-        // Subscribe to response channel and wait for final response, calling on_progress for intermediate messages
+        // Wait for final response, calling on_progress for intermediate messages
         let final_message = self
-            .wait_for_final_response(&request_id, on_progress)
+            .wait_for_final_response_with_pubsub(&request_id, pubsub, on_progress)
             .await
             .context("Failed to get response from vagent-graph")?;
 
@@ -178,20 +186,16 @@ impl RedisGraphClient {
     }
 
     /// Wait for final response, calling on_progress for intermediate progress messages
-    async fn wait_for_final_response<F>(
+    async fn wait_for_final_response_with_pubsub<F>(
         &mut self,
         request_id: &str,
+        mut pubsub: redis::aio::PubSub,
         on_progress: F,
     ) -> Result<GraphMessage>
     where
         F: Fn(String) + Send + 'static,
     {
-        // Create a new pubsub connection for listening
-        let client = Client::open(self.redis_url.as_str())
-            .context("Failed to create Redis client for pubsub")?;
-        let mut pubsub = client.get_async_pubsub().await?;
-
-        pubsub.subscribe(&self.response_channel).await?;
+        // Pubsub connection already subscribed before calling this function
 
         let timeout_duration = Duration::from_secs(30);
         let start_time = std::time::Instant::now();
@@ -217,10 +221,13 @@ impl RedisGraphClient {
             };
 
             let payload: String = message.get_payload()?;
+            debug!("Received Redis message: {}", payload);
 
             // Try to parse as GraphMessage first (new format)
             if let Ok(graph_msg) = serde_json::from_str::<GraphMessage>(&payload) {
+                debug!("Parsed GraphMessage: type={:?}, request_id={}", graph_msg.message_type, graph_msg.request_id);
                 if graph_msg.request_id == request_id {
+                    debug!("Request ID matches! Type: {:?}", graph_msg.message_type);
                     match graph_msg.message_type {
                         GraphMessageType::Progress => {
                             // Call progress callback and continue waiting
