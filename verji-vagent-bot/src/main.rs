@@ -63,31 +63,64 @@ async fn setup_encryption(client: &Client, store_path: &PathBuf) -> Result<()> {
     info!("  Recovery state: {:?}", state);
 
     if state == matrix_sdk::encryption::recovery::RecoveryState::Disabled {
-        info!("  Enabling recovery and backups...");
+        info!("  Checking for existing backup on server...");
 
-        // Enable recovery with automatic backup
-        match recovery.enable().await {
-            Ok(recovery_key) => {
-                info!("  ✅ Recovery and backups enabled successfully");
+        // Check if a backup exists on the server
+        match encryption.backups().exists_on_server().await {
+            Ok(true) => {
+                info!("  📦 Backup already exists on server");
+                info!("  Note: Cannot create new recovery key when backup exists");
+                info!("  This is normal if the account was used before");
 
-                // Save recovery key to file
-                let recovery_key_path = store_path.join("recovery_key.txt");
-                match std::fs::write(&recovery_key_path, &recovery_key) {
-                    Ok(_) => {
-                        info!("  ✅ Recovery key saved to: {:?}", recovery_key_path);
-                        info!("  🔑 Recovery key: {}", recovery_key);
-                        info!("     ⚠️  IMPORTANT: Save this recovery key securely!");
+                // Try to fetch and enable the existing backup if we have the recovery key
+                // For now, just log that backups exist
+                info!("  ⚠️  To use existing backup, you need the recovery key from previous setup");
+            }
+            Ok(false) => {
+                info!("  No existing backup found, creating new one...");
+
+                // Enable recovery with automatic backup
+                match recovery.enable().await {
+                    Ok(recovery_key) => {
+                        info!("  ✅ Recovery and backups enabled successfully");
+
+                        // Save recovery key to file
+                        let recovery_key_path = store_path.join("recovery_key.txt");
+                        match std::fs::write(&recovery_key_path, &recovery_key) {
+                            Ok(_) => {
+                                info!("  ✅ Recovery key saved to: {:?}", recovery_key_path);
+                                info!("  🔑 Recovery key: {}", recovery_key);
+                                info!("     ⚠️  IMPORTANT: Save this recovery key securely!");
+                            }
+                            Err(e) => {
+                                warn!("  ⚠️  Failed to save recovery key to file: {}", e);
+                                info!("  🔑 Recovery key: {}", recovery_key);
+                                info!("     ⚠️  IMPORTANT: Save this recovery key securely!");
+                            }
+                        }
                     }
                     Err(e) => {
-                        warn!("  ⚠️  Failed to save recovery key to file: {}", e);
-                        info!("  🔑 Recovery key: {}", recovery_key);
-                        info!("     ⚠️  IMPORTANT: Save this recovery key securely!");
+                        warn!("  ⚠️  Failed to enable recovery: {}", e);
+                        info!("     This is non-fatal, encryption will still work");
                     }
                 }
             }
             Err(e) => {
-                warn!("  ⚠️  Failed to enable recovery: {}", e);
-                info!("     This is non-fatal, encryption will still work");
+                warn!("  ⚠️  Failed to check backup status: {}", e);
+                info!("     Will try to enable recovery anyway...");
+
+                // Try to enable anyway
+                match recovery.enable().await {
+                    Ok(recovery_key) => {
+                        info!("  ✅ Recovery enabled");
+                        let recovery_key_path = store_path.join("recovery_key.txt");
+                        let _ = std::fs::write(&recovery_key_path, &recovery_key);
+                        info!("  🔑 Recovery key: {}", recovery_key);
+                    }
+                    Err(e2) => {
+                        warn!("  ⚠️  Could not enable recovery: {}", e2);
+                    }
+                }
             }
         }
     } else {
