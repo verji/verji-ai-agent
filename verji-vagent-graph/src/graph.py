@@ -1,16 +1,19 @@
 """
 LangGraph workflow for Verji vAgent.
 
-This module implements a simple conversational agent using LangGraph with OpenAI,
-demonstrating streaming progress updates at each node.
+This module implements a conversational agent using LangGraph with OpenAI,
+with checkpoint-based conversation memory and room context awareness.
 """
 
 import logging
-from typing import TypedDict, Annotated, Sequence
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
+from typing import TypedDict, Annotated, Sequence, Optional, List
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
+from langgraph.checkpoint.base import BaseCheckpointSaver
+
+from types import RoomMessage
 
 logger = logging.getLogger(__name__)
 
@@ -19,19 +22,23 @@ class AgentState(TypedDict):
     """State for the agent workflow."""
     messages: Annotated[Sequence[BaseMessage], add_messages]
     request_id: str
+    session_id: str
+    room_context: Optional[str]  # Formatted room context (ephemeral, not persisted)
 
 
 class VerjiAgent:
-    """LangGraph-based conversational agent with streaming progress."""
+    """LangGraph-based conversational agent with checkpoint memory and room context."""
 
-    def __init__(self, emit_progress_callback):
+    def __init__(self, emit_progress_callback, checkpointer: BaseCheckpointSaver):
         """
         Initialize the agent.
 
         Args:
             emit_progress_callback: Async function(request_id, content) to emit progress
+            checkpointer: LangGraph checkpointer for conversation memory
         """
         self.emit_progress = emit_progress_callback
+        self.checkpointer = checkpointer
         self.llm = ChatOpenAI(
             model="gpt-4o-mini",
             temperature=0.7,
@@ -40,7 +47,7 @@ class VerjiAgent:
         self.graph = self._build_graph()
 
     def _build_graph(self) -> StateGraph:
-        """Build the LangGraph workflow."""
+        """Build the LangGraph workflow with checkpointer."""
         workflow = StateGraph(AgentState)
 
         # Add nodes
@@ -54,7 +61,8 @@ class VerjiAgent:
         workflow.add_edge("think", "respond")
         workflow.add_edge("respond", END)
 
-        return workflow.compile()
+        # Compile with checkpointer
+        return workflow.compile(checkpointer=self.checkpointer)
 
     async def _analyze_node(self, state: AgentState) -> AgentState:
         """Analyze the user's question."""
@@ -75,45 +83,105 @@ class VerjiAgent:
         return state
 
     async def _respond_node(self, state: AgentState) -> AgentState:
-        """Generate response using LLM."""
+        """Generate response using LLM with room context."""
         await self.emit_progress(
             state["request_id"],
             "✍️ Formulating answer..."
         )
 
-        # Get the user's message
-        user_message = state["messages"][-1].content
+        # Build LLM input with room context + conversation history
+        llm_messages = []
+
+        # Add room context as SystemMessage (NOT saved to checkpoint)
+        if state.get("room_context"):
+            llm_messages.append(SystemMessage(content=state["room_context"]))
+            logger.info(f"[{state['request_id']}] Including room context in prompt")
+
+        # Add conversation history from checkpoint
+        llm_messages.extend(state["messages"])
 
         # Call OpenAI LLM
         logger.info(f"[{state['request_id']}] Calling OpenAI...")
-        response = await self.llm.ainvoke(state["messages"])
+        response = await self.llm.ainvoke(llm_messages)
 
-        # Add AI response to messages
-        state["messages"].append(AIMessage(content=response.content))
+        # Add AI response to messages (this WILL be saved to checkpoint)
+        # Note: SystemMessage is NOT in state["messages"], so it won't be saved
+        return {"messages": [AIMessage(content=response.content)]}
 
-        logger.info(f"[{state['request_id']}] LLM response: {response.content}")
-        return state
-
-    async def process(self, request_id: str, user_message: str) -> str:
+    def _format_room_context(self, room_context: List[RoomMessage]) -> Optional[str]:
         """
-        Process a user message through the graph.
+        Format room context into system message text.
+
+        Args:
+            room_context: List of room messages
+
+        Returns:
+            Formatted string or None if no context
+        """
+        if not room_context:
+            return None
+
+        lines = ["Recent room discussion:", ""]
+
+        for msg in room_context:
+            # Extract name from Matrix ID (@alice:matrix.org → Alice)
+            sender_name = msg.sender.split(":")[0].lstrip("@").title()
+            if msg.is_bot:
+                sender_name = "Assistant"
+
+            lines.append(f"{sender_name}: {msg.content}")
+
+        lines.extend([
+            "",
+            "Answer the user's question based on the above context and conversation history."
+        ])
+
+        return "\n".join(lines)
+
+    async def process(
+        self,
+        request_id: str,
+        session_id: str,
+        query: str,
+        room_context: Optional[List[RoomMessage]] = None,
+    ) -> str:
+        """
+        Process a user message through the graph with checkpoint persistence.
 
         Args:
             request_id: Unique request identifier
-            user_message: The user's message
+            session_id: Session ID for checkpoint isolation (format: room:thread:user)
+            query: The user's query
+            room_context: Optional list of recent room messages
 
         Returns:
             The final AI response
         """
-        # Create initial state
-        initial_state = {
-            "messages": [HumanMessage(content=user_message)],
-            "request_id": request_id,
+        # Configuration for LangGraph (thread_id is used for checkpoint isolation)
+        config = {
+            "configurable": {
+                "thread_id": session_id,
+            }
         }
 
-        # Run the graph
-        logger.info(f"[{request_id}] Starting graph execution")
-        final_state = await self.graph.ainvoke(initial_state)
+        # Format room context (ephemeral, not persisted)
+        room_context_text = self._format_room_context(room_context) if room_context else None
+
+        # Build input state
+        # IMPORTANT: Only messages, request_id, session_id will persist in checkpoint
+        # room_context is ephemeral (no annotation, overwrites each time)
+        input_state = {
+            "messages": [HumanMessage(content=query)],
+            "request_id": request_id,
+            "session_id": session_id,
+            "room_context": room_context_text,  # Ephemeral field
+        }
+
+        # Run the graph (LangGraph will merge with checkpoint automatically)
+        logger.info(f"[{request_id}] Starting graph execution with session {session_id}")
+        logger.info(f"[{request_id}] Room context: {len(room_context) if room_context else 0} messages")
+
+        final_state = await self.graph.ainvoke(input_state, config=config)
 
         # Extract the final AI message
         ai_messages = [msg for msg in final_state["messages"] if isinstance(msg, AIMessage)]
