@@ -12,9 +12,10 @@
 2. [Core Concepts](#2-core-concepts)
 3. [Data Flow](#3-data-flow)
 4. [Encryption Architecture](#4-encryption-architecture)
-5. [Implementation Details](#5-implementation-details)
-6. [Security Analysis](#6-security-analysis)
-7. [Configuration](#7-configuration)
+5. [Tool Management & ReAct Loop](#5-tool-management--react-loop)
+6. [Implementation Details](#6-implementation-details)
+7. [Security Analysis](#7-security-analysis)
+8. [Configuration](#8-configuration)
 
 ---
 
@@ -642,9 +643,366 @@ Layer 4: Infrastructure Security
 
 ---
 
-## 5. Implementation Details
+## 5. Tool Management & ReAct Loop
 
-### 5.1 Rust Bot: Room Context Fetching
+### 5.1 Architecture Decision: LangGraph ToolNode
+
+**Decision**: Use LangGraph's built-in `ToolNode` for automatic tool execution with manual graph control (Option 2)
+
+**Rationale**:
+- ✅ LangGraph handles tool parsing and execution automatically
+- ✅ We maintain control over RBAC filtering, HITL approval, and custom routing
+- ✅ No need to manually parse `tool_calls` or create `ToolMessage` objects
+- ✅ Supports parallel tool execution out of the box
+- ✅ Built-in error handling with `handle_tool_errors`
+
+**Why Not `create_react_agent` (Option 1)?**
+
+While `create_react_agent()` provides a fully automated ReAct loop, we need custom control for:
+- Tool filtering based on user permissions (RBAC)
+- HITL approval before executing dangerous tools
+- Credential injection from Credential Registry
+- Progress reporting at each workflow step
+- Custom conditional routing based on access control
+
+### 5.2 Tool Management Responsibility Matrix
+
+| **Task** | **Who Handles It** | **Where** | **Details** |
+|----------|-------------------|-----------|-------------|
+| **Provide tools list** | Developer | Graph initialization | Define all available tools |
+| **Filter tools by RBAC** | Custom code | `filter_tools_node` | Check `AcContext` permissions |
+| **Bind tools to LLM** | Custom code | `filter_tools_node` | Call `model.bind_tools(filtered_tools)` |
+| **LLM decides to call tools** | LLM (automatic) | `agent_node` | Model returns `tool_calls` in AIMessage |
+| **Parse tool calls** | ToolNode (automatic) | `execute_tools` node | ToolNode extracts `tool_calls` from AIMessage |
+| **Execute tools** | ToolNode (automatic) | `execute_tools` node | ToolNode invokes tools with arguments |
+| **Create ToolMessage** | ToolNode (automatic) | `execute_tools` node | ToolNode wraps results in ToolMessage |
+| **ReAct loop** | Graph structure | Workflow edges | Conditional edges loop back to agent |
+| **HITL approval** | Custom code | `hitl_approval` node | Checkpoint, emit event, exit |
+| **Progress reporting** | Custom code | All nodes | Emit progress via callback |
+
+### 5.3 LangGraph Workflow Structure
+
+```python
+from langgraph.graph import StateGraph, MessagesState, END
+from langgraph.prebuilt import ToolNode
+from langchain_openai import ChatOpenAI
+
+class AgentState(TypedDict):
+    """Extended state with RBAC and room context."""
+    messages: Annotated[Sequence[BaseMessage], add_messages]
+    session_id: str
+    ac_context: Dict  # Access control context from bot
+    room_context: Optional[str]  # Ephemeral, not persisted
+    available_tools: List[str]  # Filtered tool names
+    model: Any  # Model with tools bound
+
+class VerjiAgent:
+    def __init__(self, emit_progress_callback, checkpointer):
+        self.emit_progress = emit_progress_callback
+
+        # All available tools (before filtering)
+        self.all_tools = {
+            "search_database": search_database_tool,
+            "query_graphrag": query_graphrag_tool,
+            "send_email": send_email_tool,
+            "delete_records": delete_records_tool,
+        }
+
+        # Base LLM (tools bound per-request after filtering)
+        self.llm = ChatOpenAI(model="gpt-4o-mini")
+
+        # Build graph
+        self.graph = self._build_graph().compile(checkpointer=checkpointer)
+
+    def _build_graph(self) -> StateGraph:
+        """Build LangGraph workflow with RBAC-aware tool execution."""
+        workflow = StateGraph(AgentState)
+
+        # Node 1: Filter tools based on AcContext
+        workflow.add_node("filter_tools", self._filter_tools_node)
+
+        # Node 2: Agent reasoning with filtered tools
+        workflow.add_node("agent", self._agent_node)
+
+        # Node 3: ToolNode automatically executes tools
+        tool_list = list(self.all_tools.values())
+        workflow.add_node("execute_tools", ToolNode(tool_list))
+
+        # Node 4: HITL approval (if needed)
+        workflow.add_node("hitl_approval", self._hitl_node)
+
+        # Entry point
+        workflow.set_entry_point("filter_tools")
+
+        # Linear flow: filter → agent
+        workflow.add_edge("filter_tools", "agent")
+
+        # Conditional routing after agent
+        workflow.add_conditional_edges(
+            "agent",
+            self._should_continue,
+            {
+                "tools": "execute_tools",
+                "hitl": "hitl_approval",
+                "end": END,
+            }
+        )
+
+        # Loop back to agent after tool execution
+        workflow.add_edge("execute_tools", "agent")
+
+        # HITL exits (checkpoints and waits for user)
+        workflow.add_edge("hitl_approval", END)
+
+        return workflow
+
+    async def _filter_tools_node(self, state: AgentState) -> AgentState:
+        """
+        Node 1: Filter tools based on user permissions.
+
+        This is where RBAC enforcement happens BEFORE the LLM sees tools.
+        """
+        ac_context = state["ac_context"]
+        session_id = state["session_id"]
+
+        await self.emit_progress(session_id, "🔍 Checking your permissions...")
+
+        # Filter tools based on AcContext.ActiveRoles
+        allowed_tools = []
+        for tool_name, tool_func in self.all_tools.items():
+            if self._has_tool_access(ac_context, tool_name):
+                allowed_tools.append(tool_func)
+
+        # Bind filtered tools to LLM
+        model_with_tools = self.llm.bind_tools(allowed_tools)
+
+        await self.emit_progress(
+            session_id,
+            f"✅ You have access to {len(allowed_tools)} tools"
+        )
+
+        return {
+            "available_tools": [t.name for t in allowed_tools],
+            "model": model_with_tools,
+        }
+
+    def _has_tool_access(self, ac_context: Dict, tool_name: str) -> bool:
+        """Check if user has access to tool based on AcContext."""
+        resource_name = f"tool:{tool_name}"
+
+        # Check if any active role has permission for this tool
+        for role in ac_context.get("ActiveRoles", []):
+            for permission in role.get("Permissions", []):
+                if permission.get("ResourceType") == resource_name:
+                    # Check required action (e.g., "execute")
+                    if "execute" in permission.get("Actions", []):
+                        return True
+
+        return False
+
+    async def _agent_node(self, state: AgentState) -> AgentState:
+        """
+        Node 2: Agent reasoning with filtered tools.
+
+        LLM decides whether to use tools, which tools to call, and with what arguments.
+        """
+        model = state["model"]
+        session_id = state["session_id"]
+
+        # Build LLM input with room context (ephemeral)
+        llm_messages = []
+
+        if state.get("room_context"):
+            llm_messages.append(SystemMessage(content=state["room_context"]))
+
+        llm_messages.extend(state["messages"])
+
+        await self.emit_progress(session_id, "🧠 Thinking...")
+
+        # Call LLM (may return tool calls)
+        response = await model.ainvoke(llm_messages)
+
+        # Return updated state (ToolNode will parse tool_calls automatically)
+        return {"messages": [response]}
+
+    def _should_continue(self, state: AgentState) -> str:
+        """
+        Conditional routing: Decide next step based on agent output.
+
+        This is where we check if the agent wants to use tools or needs HITL approval.
+        """
+        last_message = state["messages"][-1]
+
+        # No tool calls → agent is done
+        if not last_message.tool_calls:
+            return "end"
+
+        # Check if any tool requires HITL approval
+        for tool_call in last_message.tool_calls:
+            tool_name = tool_call["name"]
+
+            # Dangerous tools require HITL
+            if tool_name in ["delete_records", "send_email"]:
+                return "hitl"
+
+        # Safe to execute tools directly
+        return "tools"
+
+    async def _hitl_node(self, state: AgentState) -> AgentState:
+        """
+        Node 4: Request HITL approval and checkpoint.
+
+        Graph exits here, bot waits for user response.
+        """
+        session_id = state["session_id"]
+        last_message = state["messages"][-1]
+
+        # Extract proposed action
+        tool_call = last_message.tool_calls[0]
+        tool_name = tool_call["name"]
+        tool_args = tool_call["args"]
+
+        # Format approval request
+        approval_text = f"⚠️ Approval needed: {tool_name}({tool_args})"
+
+        await self.emit_progress(session_id, approval_text)
+
+        # Checkpoint happens automatically
+        return {"status": "awaiting_hitl"}
+```
+
+### 5.4 What ToolNode Does Automatically
+
+**Input**: `MessagesState` with last message being `AIMessage` containing `tool_calls`
+
+**Process**:
+1. Parse `tool_calls` array from `AIMessage`
+2. Map each tool call name to registered tool function
+3. Execute tools (parallel execution for multiple calls)
+4. Wrap each result in `ToolMessage` with `tool_call_id`
+5. Return updated state with `ToolMessage` objects added to `messages`
+
+**Example**:
+```python
+# Agent output (AIMessage)
+AIMessage(
+    content="",
+    tool_calls=[
+        {
+            "id": "call_123",
+            "name": "search_database",
+            "args": {"query": "user data"}
+        }
+    ]
+)
+
+# ToolNode automatically produces:
+ToolMessage(
+    content='{"results": ["user1", "user2"]}',
+    tool_call_id="call_123",
+    name="search_database"
+)
+
+# State after ToolNode:
+{
+    "messages": [
+        HumanMessage("Find users"),
+        AIMessage(tool_calls=[...]),
+        ToolMessage(content='{"results": [...]}', tool_call_id="call_123")
+    ]
+}
+
+# Graph loops back to agent node
+# Agent sees tool results and can:
+# - Call more tools
+# - Return final answer
+```
+
+### 5.5 Benefits of This Approach
+
+**Security**:
+- ✅ Tool filtering happens BEFORE LLM sees tools (defense in depth)
+- ✅ LLM cannot "hallucinate" access to tools user doesn't have
+- ✅ HITL checkpointing works naturally with encrypted checkpoints
+
+**Performance**:
+- ✅ Parallel tool execution handled by ToolNode
+- ✅ No manual orchestration code
+- ✅ Efficient state updates via LangGraph reducers
+
+**Maintainability**:
+- ✅ Clear separation of concerns (RBAC → Agent → Tools → HITL)
+- ✅ Easy to add new tools (just add to `self.all_tools`)
+- ✅ Easy to add new RBAC rules (update `_has_tool_access`)
+- ✅ Progress reporting at each node
+
+**Flexibility**:
+- ✅ Can add custom nodes (e.g., RAG retrieval, credential injection)
+- ✅ Can customize conditional routing (e.g., different HITL rules)
+- ✅ Can emit custom events (e.g., audit logs, telemetry)
+
+### 5.6 Credential Injection Pattern
+
+For tools that require user-specific credentials (e.g., database passwords, API keys):
+
+```python
+async def _inject_credentials_node(self, state: AgentState) -> AgentState:
+    """
+    Optional node: Inject user-specific credentials before tool execution.
+
+    Add this node BEFORE execute_tools in workflow.
+    """
+    session_id = state["session_id"]
+    ac_context = state["ac_context"]
+    user_id = session_id.split(":")[-1]  # Extract from session_id
+
+    # Get credentials from Credential Registry
+    credentials = await self.credential_registry.get_credentials(
+        user_id=user_id,
+        tool_names=state["available_tools"]
+    )
+
+    # Store in state (will be available to tools)
+    return {"credentials": credentials}
+
+# In tool implementation:
+def search_database_tool(query: str, state: AgentState) -> str:
+    """Search database using user's credentials."""
+    credentials = state.get("credentials", {})
+    db_password = credentials.get("database_password")
+
+    # Use user-specific credentials
+    conn = psycopg2.connect(..., password=db_password)
+    results = conn.execute(query)
+    return results
+```
+
+### 5.7 Integration with Existing Architecture
+
+**Fits naturally with**:
+- ✅ Dual context system (room context + checkpoint)
+- ✅ Encrypted checkpoints (tool state persisted securely)
+- ✅ HITL pattern (checkpoint before HITL, resume after approval)
+- ✅ Progress reporting (emit at each node)
+- ✅ RBAC enforcement (filter tools per user)
+
+**Data flow with tools**:
+```
+1. Bot fetches room context (Matrix API)
+2. Bot sends request to Graph (Redis pubsub)
+3. Graph filters tools (RBAC check)
+4. Graph binds filtered tools to LLM
+5. LLM decides to call tool
+6. ToolNode executes tool automatically
+7. Graph saves checkpoint (encrypted, includes tool results)
+8. Graph returns response to bot
+```
+
+---
+
+## 6. Implementation Details
+
+### 6.1 Rust Bot: Room Context Fetching
 
 **File**: `verji-vagent-bot/src/responders/verji_agent.rs`
 
@@ -706,7 +1064,7 @@ impl VerjiAgentResponder {
 - Returns chronological order
 - Non-fatal errors (returns empty vec)
 
-### 5.2 Python Graph: Encrypted Checkpoint Saver
+### 6.2 Python Graph: Encrypted Checkpoint Saver
 
 **File**: `verji-vagent-graph/src/encrypted_checkpoint.py`
 
@@ -814,7 +1172,7 @@ class EncryptedRedisSaver(AsyncRedisSaver):
         return checkpoint_tuple
 ```
 
-### 5.3 Python Graph: Agent with Room Context
+### 6.3 Python Graph: Agent with Room Context
 
 **File**: `verji-vagent-graph/src/graph.py`
 
@@ -918,9 +1276,9 @@ class VerjiAgent:
 
 ---
 
-## 6. Security Analysis
+## 7. Security Analysis
 
-### 6.1 Data Classification
+### 7.1 Data Classification
 
 | Data | Sensitivity | Encrypted? | Storage | Lifetime |
 |------|-------------|------------|---------|----------|
@@ -934,7 +1292,7 @@ class VerjiAgent:
 | Progress messages | Low | No | Redis pubsub (ephemeral) | Seconds |
 | Encryption key | Critical | No | Environment variable | Permanent |
 
-### 6.2 Compliance Considerations
+### 7.2 Compliance Considerations
 
 #### **GDPR Requirements**
 
@@ -971,9 +1329,9 @@ async def export_session(session_id: str):
 
 ---
 
-## 7. Configuration
+## 8. Configuration
 
-### 7.1 Environment Variables
+### 8.1 Environment Variables
 
 ```bash
 # .env (project root)
@@ -1006,7 +1364,7 @@ REDIS_URL=redis://localhost:6379
 # REDIS_URL=rediss://redis.example.com:6379
 ```
 
-### 7.2 Key Management
+### 8.2 Key Management
 
 #### **Key Generation**
 
