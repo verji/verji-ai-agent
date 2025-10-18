@@ -18,7 +18,7 @@ from pathlib import Path
 from langgraph.checkpoint.redis import AsyncRedisSaver
 
 from graph import VerjiAgent
-from types import GraphRequest
+from schemas import GraphRequest
 
 # Load environment variables from .env file in project root
 env_path = Path(__file__).parent.parent.parent / ".env"

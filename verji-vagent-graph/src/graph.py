@@ -13,7 +13,7 @@ from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
-from types import RoomMessage
+from schemas import RoomMessage
 
 logger = logging.getLogger(__name__)
 

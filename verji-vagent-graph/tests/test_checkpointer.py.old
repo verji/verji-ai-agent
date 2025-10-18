@@ -1,0 +1,351 @@
+"""
+Unit tests for checkpoint persistence (graph.py + main.py).
+
+Tests checkpoint creation, loading, session isolation, and conversation memory
+across multiple queries.
+"""
+
+import pytest
+import sys
+from pathlib import Path
+from unittest.mock import AsyncMock, patch, MagicMock
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+
+# Add src to path
+src_path = Path(__file__).parent.parent / "src"
+sys.path.insert(0, str(src_path))
+
+from graph import VerjiAgent
+from schemas import RoomMessage
+
+
+class TestCheckpointPersistence:
+    """Test checkpoint save/load functionality."""
+
+    @pytest.fixture
+    def agent_with_real_checkpointer(self, mock_emit_progress):
+        """Create agent with a real checkpointer (mocked Redis underneath)."""
+        from langgraph.checkpoint.redis import AsyncRedisSaver
+        from unittest.mock import AsyncMock
+
+        # Mock the Redis client that AsyncRedisSaver uses
+        mock_redis = AsyncMock()
+        mock_redis.hget = AsyncMock(return_value=None)
+        mock_redis.hset = AsyncMock(return_value=1)
+        mock_redis.hgetall = AsyncMock(return_value={})
+        mock_redis.hscan = AsyncMock(return_value=(0, {}))
+        mock_redis.delete = AsyncMock(return_value=1)
+        mock_redis.setex = AsyncMock(return_value=True)
+        mock_redis.expire = AsyncMock(return_value=True)
+
+        # Create real checkpointer with mocked Redis
+        checkpointer = AsyncRedisSaver(mock_redis)
+
+        agent = VerjiAgent(
+            emit_progress_callback=mock_emit_progress,
+            checkpointer=checkpointer,
+        )
+
+        return agent
+
+    @pytest.mark.asyncio
+    async def test_checkpoint_created_after_execution(
+        self, agent_with_real_checkpointer, mock_emit_progress, session_id_main
+    ):
+        """Test that checkpoint is created after graph execution."""
+        agent = agent_with_real_checkpointer
+
+        # Mock the LLM response
+        with patch.object(agent.llm, "ainvoke", new_callable=AsyncMock) as mock_llm:
+            mock_llm.return_value = AIMessage(content="Hello! I'm here to help.")
+
+            # Process a query
+            response = await agent.process(
+                request_id="req-001",
+                session_id=session_id_main,
+                query="Hello",
+                room_context=None,
+            )
+
+            assert response == "Hello! I'm here to help."
+
+            # Verify LLM was called
+            assert mock_llm.call_count >= 1
+
+    @pytest.mark.asyncio
+    async def test_conversation_memory_across_multiple_queries(
+        self, agent_with_real_checkpointer, session_id_main
+    ):
+        """Test that bot remembers previous conversation."""
+        agent = agent_with_real_checkpointer
+
+        # Mock the LLM to return different responses
+        with patch.object(agent.llm, "ainvoke", new_callable=AsyncMock) as mock_llm:
+            # First query: "My name is Alice"
+            mock_llm.return_value = AIMessage(content="Nice to meet you, Alice!")
+            response1 = await agent.process(
+                request_id="req-001",
+                session_id=session_id_main,
+                query="My name is Alice",
+                room_context=None,
+            )
+            assert "Alice" in response1
+
+            # Second query: "What's my name?"
+            # Check that the LLM receives the previous conversation in messages
+            async def check_conversation_history(messages):
+                # Should have: [HumanMessage("My name is Alice"), AIMessage("Nice to meet you..."), HumanMessage("What's my name?")]
+                assert len(messages) >= 3
+                human_messages = [m for m in messages if isinstance(m, HumanMessage)]
+                ai_messages = [m for m in messages if isinstance(m, AIMessage)]
+
+                assert len(human_messages) >= 2
+                assert "My name is Alice" in human_messages[0].content
+                assert "What's my name?" in human_messages[1].content
+
+                assert len(ai_messages) >= 1
+                assert "Alice" in ai_messages[0].content
+
+                return AIMessage(content="Your name is Alice")
+
+            mock_llm.side_effect = check_conversation_history
+
+            response2 = await agent.process(
+                request_id="req-002",
+                session_id=session_id_main,
+                query="What's my name?",
+                room_context=None,
+            )
+
+            # LLM should have been called with conversation history
+            assert mock_llm.call_count >= 2
+
+    @pytest.mark.asyncio
+    async def test_session_isolation_different_users(
+        self, agent_with_real_checkpointer
+    ):
+        """Test that different session_ids have separate checkpoints."""
+        agent = agent_with_real_checkpointer
+
+        session_alice = "!room:main:@alice:matrix.org"
+        session_bob = "!room:main:@bob:matrix.org"
+
+        with patch.object(agent.llm, "ainvoke", new_callable=AsyncMock) as mock_llm:
+            # Alice's conversation
+            mock_llm.return_value = AIMessage(content="Hi Alice!")
+            await agent.process(
+                request_id="req-alice-1",
+                session_id=session_alice,
+                query="My favorite color is blue",
+                room_context=None,
+            )
+
+            # Bob's conversation (should not see Alice's messages)
+            async def check_bob_isolation(messages):
+                # Bob's messages should only contain his query, not Alice's
+                human_messages = [m for m in messages if isinstance(m, HumanMessage)]
+                for msg in human_messages:
+                    assert "blue" not in msg.content  # Should not see Alice's favorite color
+                    assert "favorite color" not in msg.content
+
+                return AIMessage(content="Hi Bob!")
+
+            mock_llm.side_effect = check_bob_isolation
+
+            await agent.process(
+                request_id="req-bob-1",
+                session_id=session_bob,
+                query="Hello",
+                room_context=None,
+            )
+
+    @pytest.mark.asyncio
+    async def test_room_context_not_persisted_in_checkpoint(
+        self, agent_with_real_checkpointer, session_id_main
+    ):
+        """Test that room_context (SystemMessage) is NOT saved to checkpoint."""
+        agent = agent_with_real_checkpointer
+
+        room_context = [
+            RoomMessage(
+                sender="@alice:matrix.org",
+                content="Ephemeral room message",
+                timestamp=1705000000,
+                is_bot=False,
+            )
+        ]
+
+        with patch.object(agent.llm, "ainvoke", new_callable=AsyncMock) as mock_llm:
+            # First query with room context
+            async def check_first_call(messages):
+                # First call should have SystemMessage (room context) + HumanMessage
+                system_messages = [m for m in messages if isinstance(m, SystemMessage)]
+                assert len(system_messages) == 1
+                assert "Ephemeral room message" in system_messages[0].content
+                return AIMessage(content="Response 1")
+
+            mock_llm.side_effect = check_first_call
+
+            await agent.process(
+                request_id="req-001",
+                session_id=session_id_main,
+                query="First query",
+                room_context=room_context,
+            )
+
+            # Second query WITHOUT room context
+            async def check_second_call(messages):
+                # Second call should have conversation history but NO SystemMessage
+                # (room context should not be persisted)
+                system_messages = [m for m in messages if isinstance(m, SystemMessage)]
+                assert len(system_messages) == 0  # Room context not persisted
+
+                # Should have conversation history though
+                human_messages = [m for m in messages if isinstance(m, HumanMessage)]
+                assert len(human_messages) >= 1
+
+                return AIMessage(content="Response 2")
+
+            mock_llm.side_effect = check_second_call
+
+            await agent.process(
+                request_id="req-002",
+                session_id=session_id_main,
+                query="Second query",
+                room_context=None,  # No room context this time
+            )
+
+    @pytest.mark.asyncio
+    async def test_messages_accumulate_in_checkpoint(
+        self, agent_with_real_checkpointer, session_id_main
+    ):
+        """Test that messages accumulate across multiple queries."""
+        agent = agent_with_real_checkpointer
+
+        with patch.object(agent.llm, "ainvoke", new_callable=AsyncMock) as mock_llm:
+            mock_llm.return_value = AIMessage(content="Response")
+
+            # Send 3 queries
+            for i in range(3):
+                await agent.process(
+                    request_id=f"req-{i}",
+                    session_id=session_id_main,
+                    query=f"Query {i}",
+                    room_context=None,
+                )
+
+            # On the 3rd call, should have 6 messages total:
+            # [HumanMessage, AIMessage, HumanMessage, AIMessage, HumanMessage, AIMessage]
+            # (or 7 if we count the current query)
+            last_call_args = mock_llm.call_args_list[-1]
+            messages = last_call_args[0][0]
+
+            human_messages = [m for m in messages if isinstance(m, HumanMessage)]
+            ai_messages = [m for m in messages if isinstance(m, AIMessage)]
+
+            # Should have 3 human messages and 2 AI messages from previous turns
+            assert len(human_messages) >= 3
+            assert len(ai_messages) >= 2
+
+    @pytest.mark.asyncio
+    async def test_session_id_used_as_thread_id(
+        self, agent_with_real_checkpointer, session_id_main
+    ):
+        """Test that session_id is used as thread_id for checkpoint isolation."""
+        agent = agent_with_real_checkpointer
+
+        # Spy on the graph.ainvoke call to verify config
+        original_ainvoke = agent.graph.ainvoke
+
+        async def spy_ainvoke(input_state, config=None):
+            # Verify config contains thread_id matching session_id
+            assert config is not None
+            assert "configurable" in config
+            assert config["configurable"]["thread_id"] == session_id_main
+            return await original_ainvoke(input_state, config=config)
+
+        with patch.object(agent.graph, "ainvoke", side_effect=spy_ainvoke):
+            with patch.object(agent.llm, "ainvoke", new_callable=AsyncMock) as mock_llm:
+                mock_llm.return_value = AIMessage(content="Response")
+
+                await agent.process(
+                    request_id="req-001",
+                    session_id=session_id_main,
+                    query="Test",
+                    room_context=None,
+                )
+
+
+class TestSessionIDFormats:
+    """Test different session ID formats."""
+
+    @pytest.mark.asyncio
+    async def test_main_thread_session_id(self, agent_with_real_checkpointer):
+        """Test session ID for main thread."""
+        agent = agent_with_real_checkpointer
+        session_id = "!abc123:matrix.org:main:@alice:matrix.org"
+
+        with patch.object(agent.llm, "ainvoke", new_callable=AsyncMock) as mock_llm:
+            mock_llm.return_value = AIMessage(content="Response")
+
+            response = await agent.process(
+                request_id="req-001",
+                session_id=session_id,
+                query="Test",
+                room_context=None,
+            )
+
+            assert response == "Response"
+
+    @pytest.mark.asyncio
+    async def test_threaded_session_id(self, agent_with_real_checkpointer):
+        """Test session ID for threaded conversation."""
+        agent = agent_with_real_checkpointer
+        session_id = "!abc123:matrix.org:$thread456:@alice:matrix.org"
+
+        with patch.object(agent.llm, "ainvoke", new_callable=AsyncMock) as mock_llm:
+            mock_llm.return_value = AIMessage(content="Response")
+
+            response = await agent.process(
+                request_id="req-001",
+                session_id=session_id,
+                query="Test",
+                room_context=None,
+            )
+
+            assert response == "Response"
+
+    @pytest.mark.asyncio
+    async def test_thread_vs_main_isolation(self, agent_with_real_checkpointer):
+        """Test that main thread and threaded conversations are isolated."""
+        agent = agent_with_real_checkpointer
+
+        session_main = "!room:main:@alice:matrix.org"
+        session_thread = "!room:$thread123:@alice:matrix.org"
+
+        with patch.object(agent.llm, "ainvoke", new_callable=AsyncMock) as mock_llm:
+            # Main thread conversation
+            mock_llm.return_value = AIMessage(content="Main response")
+            await agent.process(
+                request_id="req-main",
+                session_id=session_main,
+                query="Main thread message",
+                room_context=None,
+            )
+
+            # Threaded conversation (should be separate)
+            async def check_thread_isolation(messages):
+                human_messages = [m for m in messages if isinstance(m, HumanMessage)]
+                # Should NOT contain "Main thread message"
+                for msg in human_messages:
+                    assert "Main thread message" not in msg.content
+                return AIMessage(content="Thread response")
+
+            mock_llm.side_effect = check_thread_isolation
+
+            await agent.process(
+                request_id="req-thread",
+                session_id=session_thread,
+                query="Thread message",
+                room_context=None,
+            )
