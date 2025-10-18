@@ -1,8 +1,8 @@
 """
-Verji vAgent Graph Service - Echo POC
+Verji vAgent Graph Service - LangGraph with OpenAI
 
-This service listens for queries from vagent-bot via Redis and echoes them back.
-In the future, this will be replaced with actual LangGraph-based AI processing.
+This service listens for queries from vagent-bot via Redis and processes them
+using a LangGraph workflow with OpenAI LLM.
 """
 
 import asyncio
@@ -13,6 +13,13 @@ import sys
 from typing import Any, Dict
 
 import redis.asyncio as redis
+from dotenv import load_dotenv
+from pathlib import Path
+from graph import VerjiAgent
+
+# Load environment variables from .env file in project root
+env_path = Path(__file__).parent.parent.parent / ".env"
+load_dotenv(dotenv_path=env_path)
 
 # Configure logging
 logging.basicConfig(
@@ -32,9 +39,10 @@ class VAgentGraph:
         self.response_channel = "vagent:responses"
         self.redis_client: redis.Redis | None = None
         self.pubsub: redis.client.PubSub | None = None
+        self.agent: VerjiAgent | None = None
 
     async def connect(self):
-        """Connect to Redis."""
+        """Connect to Redis and initialize LangGraph agent."""
         logger.info(f"Connecting to Redis at {self.redis_url}")
         self.redis_client = await redis.from_url(
             self.redis_url,
@@ -44,6 +52,11 @@ class VAgentGraph:
         self.pubsub = self.redis_client.pubsub()
         await self.pubsub.subscribe(self.request_channel)
         logger.info(f"Subscribed to channel: {self.request_channel}")
+
+        # Initialize LangGraph agent with emit_progress callback
+        logger.info("Initializing LangGraph agent with OpenAI...")
+        self.agent = VerjiAgent(emit_progress_callback=self.emit_progress)
+        logger.info("LangGraph agent initialized")
 
     async def disconnect(self):
         """Disconnect from Redis."""
@@ -113,9 +126,7 @@ class VAgentGraph:
 
     async def process_query(self, request_id: str, query: str, metadata: Dict[str, Any]) -> None:
         """
-        Process a query from vagent-bot with streaming support.
-
-        This demonstrates progress streaming. In production, this will invoke LangGraph.
+        Process a query from vagent-bot using LangGraph with streaming progress.
 
         Args:
             request_id: The request ID for correlation
@@ -126,18 +137,8 @@ class VAgentGraph:
         logger.info(f"Metadata: {metadata}")
 
         try:
-            # Simulate multi-step processing with progress updates
-            await self.emit_progress(request_id, "🔍 Analyzing your question...")
-            await asyncio.sleep(0.5)  # Simulate work
-
-            await self.emit_progress(request_id, "🧠 Thinking about the best response...")
-            await asyncio.sleep(0.5)  # Simulate work
-
-            await self.emit_progress(request_id, "✍️ Formulating answer...")
-            await asyncio.sleep(0.5)  # Simulate work
-
-            # Echo POC: Return the query with a prefix
-            response = f"[Echo POC with Streaming] You said: {query}"
+            # Process through LangGraph agent (it will emit progress updates)
+            response = await self.agent.process(request_id, query)
 
             # Emit final response
             await self.emit_final_response(request_id, response)
