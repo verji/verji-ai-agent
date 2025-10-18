@@ -1,25 +1,10 @@
 {
   "permissions": {
     "allow": [
-      "Bash(dir:*)",
-      "Bash(git reset:*)",
-      "Bash(git add:*)",
-      "Bash(git commit:*)",
-      "Bash(git push:*)",
-      "Bash(dos2unix:*)",
-      "Bash(cargo init:*)",
-      "Bash(cargo check:*)",
-      "Bash(cargo build:*)",
-      "Bash(cargo clean:*)",
-      "Bash(cargo search:*)",
-      "Bash(cargo update:*)",
-      "Bash(cargo info:*)",
-      "Bash(cargo doc:*)",
+      "Bash(git commit -m \"$(cat <<''EOF''\nFix streaming notifications to display in Matrix rooms\n\nFixes two critical issues preventing progress messages from appearing:\n\n1. Race condition fix (redis_client.rs):\n   - Subscribe to Redis response channel BEFORE publishing request\n   - Prevents missing progress messages that arrive quickly\n   - Refactor wait_for_final_response to accept pre-subscribed pubsub connection\n   - Add debug logging to trace message flow\n\n2. Async progress callback (verji_agent.rs):\n   - Use tokio channel (mpsc) to bridge sync callback and async Matrix sends\n   - Spawn background task to send progress messages to Matrix room\n   - Each progress update now appears as a separate message in the room\n   - Wait for progress task to complete before returning final response\n\nResult: Users now see real-time progress updates in Matrix:\n- \"🔍 Analyzing your question...\"\n- \"🧠 Thinking about the best response...\"\n- \"✍️ Formulating answer...\"\n- \"[Echo POC with Streaming] You said: ...\"\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Claude <noreply@anthropic.com>\nEOF\n)\")",
+      "Bash(test:*)",
       "Bash(cat:*)",
-      "Read(//c/dev/src/rbot-ai-experiment/v-agent/src/**)",
-      "Read(//c/dev/src/rbot-ai-experiment/v-agent/**)",
-      "Bash(git restore:*)",
-      "Bash(in the constructor\" with clear user guidance.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Claude <noreply@anthropic.com>\nEOF\n)\")"
+      "Bash(git commit -m \"$(cat <<''EOF''\nImplement LangGraph workflow with OpenAI LLM\n\nReplaces simple echo POC with full LangGraph workflow using OpenAI GPT-4o-mini.\n\nChanges:\n\nNew file: verji-vagent-graph/src/graph.py\n- Implement VerjiAgent class with LangGraph StateGraph\n- Three-node workflow: analyze → think → respond\n- Each node emits progress updates via callback\n- Final node calls OpenAI LLM for AI-generated responses\n- Uses langchain_openai.ChatOpenAI with GPT-4o-mini model\n\nUpdated: verji-vagent-graph/src/main.py\n- Add python-dotenv support for .env loading from project root\n- Initialize VerjiAgent on startup with emit_progress callback\n- Simplify process_query to delegate to LangGraph agent\n- Remove hardcoded echo response logic\n\nEnvironment:\n- Consolidate .env to project root (removed duplicate in verji-vagent-graph/)\n- Load .env from project root using Path resolution\n- Both bot and graph services now share single .env file\n\nResult: Users now get real AI responses from OpenAI with streaming progress:\n- \"🔍 Analyzing your question...\"\n- \"🧠 Thinking about the best response...\"\n- \"✍️ Formulating answer...\"\n- [Actual OpenAI-generated response]\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Claude <noreply@anthropic.com>\nEOF\n)\")"
     ],
     "deny": [],
     "ask": []
