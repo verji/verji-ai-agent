@@ -1,10 +1,12 @@
 use anyhow::Result;
 use async_trait::async_trait;
+use matrix_sdk::room::Room;
+use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use crate::redis_client::RedisGraphClient;
+use crate::redis_client::{RedisGraphClient, RoomMessage};
 use crate::responder::{Responder, ResponderContext, ResponderResult};
 
 /// Verji AI Agent responder backed by LangGraph via Redis
@@ -44,6 +46,22 @@ impl VerjiAgentResponder {
 
         Ok(())
     }
+
+    /// Build session ID in format: {room_id}:{thread_id}:{user_id}
+    fn build_session_id(room_id: &str, user_id: &str, thread_id: Option<&str>) -> String {
+        let thread = thread_id.unwrap_or("main");
+        format!("{}:{}:{}", room_id, thread, user_id)
+    }
+
+    /// Fetch recent messages from Matrix room for context
+    /// TODO: Implement proper room message fetching with matrix-sdk 0.14 API
+    async fn fetch_room_context(&self, _room: &Room, _limit: usize) -> Result<Vec<RoomMessage>> {
+        // TODO: Implement room context fetching
+        // For now, return empty vec to get the flow working
+        // Will implement properly after verifying the checkpoint flow works
+        warn!("⚠️  Room context fetching not yet implemented - returning empty context");
+        Ok(Vec::new())
+    }
 }
 
 #[async_trait]
@@ -78,6 +96,23 @@ impl Responder for VerjiAgentResponder {
             return Ok(ResponderResult::Handled(Some(response)));
         }
 
+        // Fetch room context (last N messages)
+        let room_context_limit = std::env::var("ROOM_CONTEXT_LIMIT")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(20);
+
+        let room_context = self.fetch_room_context(&context.room, room_context_limit).await?;
+
+        // Build session ID
+        let session_id = Self::build_session_id(
+            context.room.room_id().as_str(),
+            &context.sender,
+            None, // TODO: Extract thread_id from event.relates_to if threaded
+        );
+
+        info!("📋 Session ID: {}", session_id);
+
         // Send query to vagent-graph via Redis with streaming support
         let mut client_guard = self.redis_client.lock().await;
         let client = client_guard.as_mut().expect("Redis client should be initialized");
@@ -91,7 +126,6 @@ impl Responder for VerjiAgentResponder {
             while let Some(progress_msg) = progress_rx.recv().await {
                 info!("📊 Sending progress to Matrix: {}", progress_msg);
 
-                use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
                 let content = RoomMessageEventContent::text_plain(&progress_msg);
 
                 if let Err(e) = room_clone.send(content).await {
@@ -108,8 +142,10 @@ impl Responder for VerjiAgentResponder {
         let result = client
             .query_with_streaming(
                 context.message_body.clone(),
+                session_id,
                 context.room.room_id().to_string(),
                 context.sender.clone(),
+                room_context,
                 on_progress,
             )
             .await;

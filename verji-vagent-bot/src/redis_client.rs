@@ -7,11 +7,22 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+/// A single message from the Matrix room
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoomMessage {
+    pub sender: String,      // "@alice:matrix.org"
+    pub content: String,     // Message text content
+    pub timestamp: u64,      // Unix timestamp (seconds)
+    pub is_bot: bool,        // true if sender is the bot
+}
+
 /// Message sent to vagent-graph for processing
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GraphRequest {
     pub request_id: String,
+    pub session_id: String,
     pub query: String,
+    pub room_context: Vec<RoomMessage>,
     pub metadata: RequestMetadata,
 }
 
@@ -111,8 +122,10 @@ impl RedisGraphClient {
     pub async fn query_with_streaming<F>(
         &mut self,
         query: String,
+        session_id: String,
         room_id: String,
         user_id: String,
+        room_context: Vec<RoomMessage>,
         on_progress: F,
     ) -> Result<String>
     where
@@ -122,7 +135,9 @@ impl RedisGraphClient {
 
         let request = GraphRequest {
             request_id: request_id.clone(),
+            session_id,
             query: query.clone(),
+            room_context,
             metadata: RequestMetadata {
                 room_id,
                 user_id,
@@ -180,9 +195,17 @@ impl RedisGraphClient {
     }
 
     /// Send a query to vagent-graph and wait for response (legacy method without streaming)
-    pub async fn query(&mut self, query: String, room_id: String, user_id: String) -> Result<String> {
+    pub async fn query(
+        &mut self,
+        query: String,
+        session_id: String,
+        room_id: String,
+        user_id: String,
+        room_context: Vec<RoomMessage>,
+    ) -> Result<String> {
         // Use streaming method with no-op callback
-        self.query_with_streaming(query, room_id, user_id, |_| {}).await
+        self.query_with_streaming(query, session_id, room_id, user_id, room_context, |_| {})
+            .await
     }
 
     /// Wait for final response, calling on_progress for intermediate progress messages
